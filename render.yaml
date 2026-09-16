@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: goldscalper-pro
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    plan: free
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TWELVE_DATA_KEY
+        sync: false

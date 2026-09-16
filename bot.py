@@ -10,7 +10,6 @@ TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # --- Indicators & Patterns ---
-
 def calc_atr(candles, period=14):
     if len(candles) < period + 1:
         return None
@@ -57,7 +56,6 @@ def detect_market_structure(candles):
     return "CHOP"
 
 # --- Signal Engine ---
-
 def analyze_signal(m5_data, m15_data):
     pattern = detect_candlestick_patterns(m5_data)
     structure = detect_market_structure(m15_data)
@@ -73,4 +71,63 @@ def analyze_signal(m5_data, m15_data):
         tp = entry + 2 * atr
         return "BUY", entry, sl, tp, f"{pattern} + {structure}"
     elif pattern in ["Bearish Engulfing", "Pin Bar (Bearish)"] and structure == "LH":
-        entry
+        entry = price
+        sl = entry + atr
+        tp = entry - 2 * atr
+        return "SELL", entry, sl, tp, f"{pattern} + {structure}"
+    else:
+        return "NO TRADE", None, None, None, "Pattern/Structure mismatch"
+
+# --- Telegram Integration ---
+def send_message(chat_id, text):
+    requests.post(f"{BASE_URL}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
+
+@app.route("/telegram", methods=["POST"])
+def handle_update():
+    data = request.get_json()
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "")
+    if not chat_id:
+        return {"ok": True}
+
+    if text == "/start":
+        send_message(chat_id, "🥇 Gold Scalper Pro\nCandlestick + Structure + ATR\nSend /signal")
+    elif text == "/signal":
+        m5_candles = get_xau_data("5min")
+        m15_candles = get_xau_data("15min")
+        signal, entry, sl, tp, reason = analyze_signal(m5_candles, m15_candles)
+        if signal in ["BUY", "SELL"]:
+            reply = f"{'🟢' if signal=='BUY' else '🔴'} *{signal}*\nEntry: ${entry:.2f}\nSL: ${sl:.2f}\nTP: ${tp:.2f}\n\nPattern: {reason}"
+        else:
+            reply = f"⚪ NO TRADE\n_{reason}_"
+        send_message(chat_id, reply)
+    return {"ok": True}
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok"}
+
+@app.route('/')
+def index():
+    return "Bot is running"
+
+# --- Data Fetch ---
+def get_xau_data(interval, limit=100):
+    url = "https://api.twelvedata.com/time_series"
+    response = requests.get(url, params={
+        "symbol": "XAU/USD",
+        "interval": interval,
+        "outputsize": limit,
+        "apikey": TWELVE_DATA_KEY
+    })
+    data = response.json()
+    return data.get("values", []) if "values" in data else []
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

@@ -5,7 +5,7 @@ import numpy as np
 
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = 8541182452:AAEChxaZ15aKXk5_ccZoZwEnhLUWY-ygA2I
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 

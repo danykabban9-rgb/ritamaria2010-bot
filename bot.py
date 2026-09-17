@@ -1,13 +1,8 @@
-import os
-import time
-import threading
-import logging
-import requests
+import os, time, threading, logging, requests
 from flask import Flask, request
 from datetime import datetime
 import pytz
 
-# --- CONFIG ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
@@ -26,15 +21,10 @@ def send_message(chat_id, text):
 
 def is_trading_window():
     now = datetime.now(BEIRUT_TZ)
-    hour = now.hour
-    # 10-12 and 14-18 Beirut
-    if (10 <= hour < 12) or (14 <= hour < 18):
-        return True, f"Window {hour}:00 OK"
-    return False, f"Outside window {hour}:00"
-
-def is_news_block():
-    # add your red news logic here if you have it
-    return False, ""
+    h = now.hour
+    if (10 <= h < 12) or (14 <= h < 18):
+        return True
+    return False
 
 def get_xau_data(interval):
     try:
@@ -45,61 +35,67 @@ def get_xau_data(interval):
         return None
 
 def analyze_v2(m5, m15):
-    # --- YOUR V2 LOGIC HERE ---
-    # This is placeholder scoring, replace with your Pin Bar + LH + trend + ATR logic
-    # return format: (signal, entry, sl, tp1, reason, tp2, score)
-    # Example for testing:
+    # TODO: put your real Pin Bar + LH logic here
+    # dummy scoring for deploy test
     import random
-    score = random.randint(30, 85)
+    score = random.randint(40, 85)
+    price = float(m5[0]["close"]) if m5 else 4350.0
     if score >= 70:
-        price = float(m5[0]["close"])
-        signal = "SELL" if float(m5[0]["close"]) < float(m5[1]["close"]) else "BUY"
-        sl = price + 5 if signal == "SELL" else price - 5
-        tp1 = price - 8 if signal == "SELL" else price + 8
-        tp2 = price - 15 if signal == "SELL" else price + 15
-        reason = f"Pin Bar + LH + Trend Align - Score {score}/100"
-        return signal, price, sl, tp1, reason, tp2, score
+        sig = "SELL" if score % 2 == 0 else "BUY"
+        sl = price + 5 if sig == "SELL" else price - 5
+        tp1 = price - 8 if sig == "SELL" else price + 8
+        tp2 = price - 15 if sig == "SELL" else price + 15
+        return sig, price, sl, tp1, f"Test Signal Score {score}", tp2, score
     else:
-        return "NO_TRADE", 0, 0, 0, f"⚪ NO TRADE Score {score}/100 - Insufficient", 0, score
+        return "NO_TRADE", 0, 0, 0, f"NO TRADE Score {score}", 0, score
 
-# --- AUTO SCANNER STRONG ONLY ---
 def auto_scanner():
     global LAST_ALERT_TIME
-    logging.info("ritamariagold V2 STRONG ONLY running - auto scanner ON")
+    logging.info("ritamariagold V2 STRONG ONLY running - scanner ON")
     while True:
         try:
-            time.sleep(300) # check every 5 min
-            can, _ = is_trading_window()
-            if not can:
+            time.sleep(300)
+            if not is_trading_window():
                 continue
-
-            blocked, _ = is_news_block()
-            if blocked:
-                continue
-
             m5 = get_xau_data("5min")
             m15 = get_xau_data("15min")
             if not m5 or not m15:
                 continue
-
             res = analyze_v2(m5, m15)
-
             if res[0] in ["BUY", "SELL"]:
-                signal, entry, sl, tp1, reason, tp2, score = res
+                sig, entry, sl, tp1, reason, tp2, score = res
                 if score < 70:
                     continue
-                if time.time() - LAST_ALERT_TIME < 3600: # 1 hour cooldown
+                if time.time() - LAST_ALERT_TIME < 3600:
                     continue
-
                 LAST_ALERT_TIME = time.time()
-                text = (
-                    f"🔔🔔🔔 *STRONG SIGNAL {score}/100*\n"
-                    f"*{signal} XAU/USD*\n"
-                    f"Entry: ${entry:.2f}\n"
-                    f"SL: ${sl:.2f}\n"
-                    f"TP1: ${tp1:.2f} -> CLOSE 50% + BE\n"
-                    f"TP2: ${tp2:.2f}\n\n"
-                    f"_{reason}_\n\n"
-                    f"Lot: 0.01 ONLY"
-                )
-                send_message(TELEGRAM_CHAT_ID,
+                text = f"🔔🔔🔔 STRONG {sig} {score}/100\nEntry ${entry:.2f} SL ${sl:.2f} TP1 ${tp1:.2f} TP2 ${tp2:.2f}\n{reason}\nLot 0.01 ONLY"
+                send_message(TELEGRAM_CHAT_ID, text)
+        except Exception as e:
+            logging.error(f"scanner {e}")
+            time.sleep(60)
+
+threading.Thread(target=auto_scanner, daemon=True).start()
+
+@app.route("/")
+def home():
+    return "ritamariagold V2 STRONG ONLY running"
+
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if "message" in data and "text" in data["message"]:
+        if "/signal" in data["message"]["text"]:
+            m5 = get_xau_data("5min")
+            m15 = get_xau_data("15min")
+            res = analyze_v2(m5, m15)
+            if res[0] in ["BUY","SELL"]:
+                sig, entry, sl, tp1, reason, tp2, score = res
+                msg = f"{sig} {score} Entry ${entry:.2f} SL ${sl:.2f} TP ${tp1:.2f}"
+            else:
+                msg = res[4]
+            send_message(data["message"]["chat"]["id"], msg)
+    return "ok"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))

@@ -80,7 +80,7 @@ threading.Thread(target=auto_scanner, daemon=True).start()
 @app.route("/")
 def home():
     return "ritamariagold V2 STRONG ONLY running"
-
+@app.route("/telegram", methods=["POST"])
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     data = request.get_json()

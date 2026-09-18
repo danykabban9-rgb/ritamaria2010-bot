@@ -3,112 +3,126 @@ import time
 import threading
 import logging
 import requests
-from flask import Flask, request
+import hashlib
 from datetime import datetime
+
 import pytz
+from flask import Flask, request
 
 # ============================================================
-# EXISTING RENDER VARIABLES — DO NOT CHANGE
+# CONFIG
 # ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 
-BEIRUT_TZ = pytz.timezone("Asia/Beirut")
+TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-app = Flask(__name__)
+BEIRUT = pytz.timezone("Asia/Beirut")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+# Scanner
+SCAN_SECONDS = 60
 
-# Prevent duplicate alerts
-LAST_SIGNAL_CANDLE = None
-LAST_SIGNAL = None
-LAST_ALERT_TIME = 0
+# Prevent repeated alerts
+last_alert_setup = None
+last_alert_time = 0
+
+# Minimum score for a trade
+MIN_SCORE = 80
+
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_message(chat_id, text):
+def send_message(text):
     try:
-        if not TELEGRAM_TOKEN or not chat_id:
-            logging.error("Telegram variables missing")
-            return False
+        url = f"{TELEGRAM_URL}/sendMessage"
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text
+        }
 
-        r = requests.post(
-            url,
-            json={
-                "chat_id": chat_id,
-                "text": text
-            },
-            timeout=10
-        )
+        r = requests.post(url, json=payload, timeout=15)
 
         if r.status_code != 200:
-            logging.error(f"Telegram error: {r.text}")
+            logging.error("Telegram error: %s", r.text)
             return False
 
         return True
 
     except Exception as e:
-        logging.error(f"Telegram send error: {e}")
+        logging.error("Telegram send error: %s", e)
         return False
 
 
 # ============================================================
-# TRADING WINDOW
+# TRADING HOURS
 # ============================================================
 
 def is_trading_window():
-    now = datetime.now(BEIRUT_TZ)
-    h = now.hour
+    now = datetime.now(BEIRUT)
+    hour = now.hour
 
-    # Main London/NY overlap periods adapted to Beirut time.
-    # Avoid overnight/low-liquidity conditions.
-    if 9 <= h < 12:
-        return True
-
-    if 14 <= h < 19:
-        return True
-
-    return False
+    # London / New York active periods
+    return (
+        9 <= hour < 12
+        or
+        14 <= hour < 19
+    )
 
 
 # ============================================================
 # TWELVE DATA
 # ============================================================
 
-def get_xau_data(interval, outputsize=120):
+def get_xau_data(interval, outputsize=150):
 
     try:
-        url = (
-            "https://api.twelvedata.com/time_series"
-            f"?symbol=XAU/USD"
-            f"&interval={interval}"
-            f"&apikey={TWELVE_DATA_KEY}"
-            f"&outputsize={outputsize}"
-            f"&order=ASC"
+
+        url = "https://api.twelvedata.com/time_series"
+
+        params = {
+            "symbol": "XAU/USD",
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": TWELVE_DATA_KEY,
+            "order": "ASC"
+        }
+
+        r = requests.get(
+            url,
+            params=params,
+            timeout=20
         )
 
-        r = requests.get(url, timeout=15)
         data = r.json()
 
         if "values" not in data:
-            logging.error(f"Twelve Data: {data}")
-            return None
 
-        values = data["values"]
+            logging.error(
+                "Twelve Data error %s: %s",
+                interval,
+                data
+            )
+
+            return []
 
         candles = []
 
-        for x in values:
+        for x in data["values"]:
+
             try:
+
                 candles.append({
                     "datetime": x["datetime"],
                     "open": float(x["open"]),
@@ -116,27 +130,55 @@ def get_xau_data(interval, outputsize=120):
                     "low": float(x["low"]),
                     "close": float(x["close"])
                 })
-            except:
+
+            except Exception:
                 continue
 
         return candles
 
     except Exception as e:
-        logging.error(f"Market data error: {e}")
-        return None
+
+        logging.error(
+            "Data error %s: %s",
+            interval,
+            e
+        )
+
+        return []
 
 
 # ============================================================
-# CANDLE FUNCTIONS
+# REMOVE CURRENT FORMING CANDLE
 # ============================================================
 
-def candle_parts(c):
-    body = abs(c["close"] - c["open"])
-    upper = c["high"] - max(c["open"], c["close"])
-    lower = min(c["open"], c["close"]) - c["low"]
-    total = c["high"] - c["low"]
+def closed_candles(candles):
 
-    return body, upper, lower, total
+    if len(candles) < 3:
+        return []
+
+    # Twelve Data normally returns the latest candle last.
+    # Remove it because it may still be forming.
+    return candles[:-1]
+
+
+# ============================================================
+# BASIC CANDLE FUNCTIONS
+# ============================================================
+
+def candle_body(c):
+    return abs(c["close"] - c["open"])
+
+
+def candle_range(c):
+    return max(c["high"] - c["low"], 0.00001)
+
+
+def upper_wick(c):
+    return c["high"] - max(c["open"], c["close"])
+
+
+def lower_wick(c):
+    return min(c["open"], c["close"]) - c["low"]
 
 
 def bullish(c):
@@ -145,56 +187,6 @@ def bullish(c):
 
 def bearish(c):
     return c["close"] < c["open"]
-
-
-def bullish_rejection(c):
-    body, upper, lower, total = candle_parts(c)
-
-    if total <= 0:
-        return False
-
-    return (
-        lower >= body * 1.5
-        and lower > upper
-        and c["close"] > c["low"] + total * 0.55
-    )
-
-
-def bearish_rejection(c):
-    body, upper, lower, total = candle_parts(c)
-
-    if total <= 0:
-        return False
-
-    return (
-        upper >= body * 1.5
-        and upper > lower
-        and c["close"] < c["high"] - total * 0.55
-    )
-
-
-def bullish_engulfing(prev, c):
-
-    return (
-        bearish(prev)
-        and bullish(c)
-        and c["open"] <= prev["close"]
-        and c["close"] >= prev["open"]
-        and abs(c["close"] - c["open"])
-        > abs(prev["close"] - prev["open"])
-    )
-
-
-def bearish_engulfing(prev, c):
-
-    return (
-        bullish(prev)
-        and bearish(c)
-        and c["open"] >= prev["close"]
-        and c["close"] <= prev["open"]
-        and abs(c["close"] - c["open"])
-        > abs(prev["close"] - prev["open"])
-    )
 
 
 # ============================================================
@@ -209,6 +201,7 @@ def calculate_atr(candles, period=14):
     trs = []
 
     for i in range(1, len(candles)):
+
         high = candles[i]["high"]
         low = candles[i]["low"]
         prev_close = candles[i - 1]["close"]
@@ -228,644 +221,887 @@ def calculate_atr(candles, period=14):
 
 
 # ============================================================
-# MARKET STRUCTURE
+# STRUCTURE
 # ============================================================
 
-def recent_high(candles, lookback=8):
+def market_structure(candles, lookback=20):
+
     if len(candles) < lookback:
-        return None
-
-    return max(c["high"] for c in candles[-lookback:])
-
-
-def recent_low(candles, lookback=8):
-    if len(candles) < lookback:
-        return None
-
-    return min(c["low"] for c in candles[-lookback:])
-
-
-def market_structure(candles):
-
-    if len(candles) < 20:
         return "NEUTRAL"
 
-    # Divide recent candles into two groups
-    old = candles[-16:-8]
-    new = candles[-8:]
+    recent = candles[-lookback:]
 
-    old_high = max(c["high"] for c in old)
-    old_low = min(c["low"] for c in old)
+    highs = [x["high"] for x in recent]
+    lows = [x["low"] for x in recent]
 
-    new_high = max(c["high"] for c in new)
-    new_low = min(c["low"] for c in new)
+    current = recent[-1]["close"]
 
-    if new_high > old_high and new_low > old_low:
+    highest = max(highs[:-3])
+    lowest = min(lows[:-3])
+
+    recent_high = max(highs[-5:])
+    recent_low = min(lows[-5:])
+
+    if current > highest and recent_low > lowest:
         return "BULLISH"
 
-    if new_high < old_high and new_low < old_low:
-        return "BEARISH"
-
-    # Break-of-structure confirmation
-    last = candles[-1]
-
-    if last["close"] > old_high:
-        return "BULLISH"
-
-    if last["close"] < old_low:
+    if current < lowest and recent_high < highest:
         return "BEARISH"
 
     return "NEUTRAL"
 
 
 # ============================================================
+# BOS
+# ============================================================
+
+def detect_bos(candles):
+
+    if len(candles) < 10:
+        return None
+
+    previous = candles[-6:-1]
+    current = candles[-1]
+
+    previous_high = max(x["high"] for x in previous)
+    previous_low = min(x["low"] for x in previous)
+
+    if current["close"] > previous_high:
+        return "BULLISH BOS"
+
+    if current["close"] < previous_low:
+        return "BEARISH BOS"
+
+    return None
+
+
+# ============================================================
 # LIQUIDITY SWEEP
 # ============================================================
 
-def bullish_liquidity_sweep(candles):
+def detect_liquidity_sweep(candles):
 
-    if len(candles) < 12:
-        return False
+    if len(candles) < 10:
+        return None
 
-    c = candles[-1]
+    current = candles[-1]
+    previous = candles[-8:-1]
 
-    previous_low = min(x["low"] for x in candles[-11:-1])
+    old_high = max(x["high"] for x in previous)
+    old_low = min(x["low"] for x in previous)
 
-    return (
-        c["low"] < previous_low
-        and c["close"] > previous_low
-    )
+    # Sweep sell-side liquidity then recover
+    if (
+        current["low"] < old_low
+        and current["close"] > old_low
+    ):
+        return "BULLISH LIQUIDITY SWEEP"
 
+    # Sweep buy-side liquidity then reject
+    if (
+        current["high"] > old_high
+        and current["close"] < old_high
+    ):
+        return "BEARISH LIQUIDITY SWEEP"
 
-def bearish_liquidity_sweep(candles):
-
-    if len(candles) < 12:
-        return False
-
-    c = candles[-1]
-
-    previous_high = max(x["high"] for x in candles[-11:-1])
-
-    return (
-        c["high"] > previous_high
-        and c["close"] < previous_high
-    )
-
-
-# ============================================================
-# BREAK OF STRUCTURE
-# ============================================================
-
-def bullish_bos(candles):
-
-    if len(candles) < 12:
-        return False
-
-    c = candles[-1]
-
-    previous_high = max(x["high"] for x in candles[-11:-1])
-
-    return c["close"] > previous_high
-
-
-def bearish_bos(candles):
-
-    if len(candles) < 12:
-        return False
-
-    c = candles[-1]
-
-    previous_low = min(x["low"] for x in candles[-11:-1])
-
-    return c["close"] < previous_low
+    return None
 
 
 # ============================================================
 # DISPLACEMENT
 # ============================================================
 
-def bullish_displacement(candles):
+def detect_displacement(candles):
 
-    if len(candles) < 6:
-        return False
+    if len(candles) < 10:
+        return None
 
-    c = candles[-1]
+    current = candles[-1]
 
-    body, upper, lower, total = candle_parts(c)
+    atr = calculate_atr(candles, 14)
 
-    if total <= 0:
-        return False
+    if atr is None:
+        return None
 
-    previous_bodies = []
+    body = candle_body(current)
 
-    for x in candles[-6:-1]:
-        b, _, _, _ = candle_parts(x)
-        previous_bodies.append(b)
+    if body < atr * 0.8:
+        return None
 
-    avg_body = sum(previous_bodies) / len(previous_bodies)
+    if bullish(current):
+        return "BULLISH DISPLACEMENT"
 
-    return (
-        bullish(c)
-        and body > avg_body * 1.5
-        and body / total > 0.55
-    )
+    if bearish(current):
+        return "BEARISH DISPLACEMENT"
 
-
-def bearish_displacement(candles):
-
-    if len(candles) < 6:
-        return False
-
-    c = candles[-1]
-
-    body, upper, lower, total = candle_parts(c)
-
-    if total <= 0:
-        return False
-
-    previous_bodies = []
-
-    for x in candles[-6:-1]:
-        b, _, _, _ = candle_parts(x)
-        previous_bodies.append(b)
-
-    avg_body = sum(previous_bodies) / len(previous_bodies)
-
-    return (
-        bearish(c)
-        and body > avg_body * 1.5
-        and body / total > 0.55
-    )
+    return None
 
 
 # ============================================================
-# MAIN CANDLE STRUCTURE ENGINE
+# CANDLE PATTERNS
 # ============================================================
 
-def analyze_pro(m1, m5, m15):
+def bullish_pin_bar(c):
+
+    body = candle_body(c)
+    rng = candle_range(c)
+
+    lw = lower_wick(c)
+    uw = upper_wick(c)
 
     if (
-        not m1
-        or not m5
-        or not m15
-        or len(m1) < 30
-        or len(m5) < 30
-        or len(m15) < 30
+        lw >= body * 2
+        and
+        lw >= uw * 1.5
+        and
+        c["close"] >= c["low"] + rng * 0.60
     ):
+        return True
+
+    return False
+
+
+def bearish_pin_bar(c):
+
+    body = candle_body(c)
+    rng = candle_range(c)
+
+    lw = lower_wick(c)
+    uw = upper_wick(c)
+
+    if (
+        uw >= body * 2
+        and
+        uw >= lw * 1.5
+        and
+        c["close"] <= c["low"] + rng * 0.40
+    ):
+        return True
+
+    return False
+
+
+def hammer(c):
+
+    body = candle_body(c)
+    rng = candle_range(c)
+
+    lw = lower_wick(c)
+    uw = upper_wick(c)
+
+    if (
+        lw >= body * 2
+        and
+        uw <= max(body * 0.8, rng * 0.08)
+        and
+        c["close"] > c["open"]
+        and
+        c["close"] >= c["low"] + rng * 0.60
+    ):
+        return True
+
+    return False
+
+
+def shooting_star(c):
+
+    body = candle_body(c)
+    rng = candle_range(c)
+
+    lw = lower_wick(c)
+    uw = upper_wick(c)
+
+    if (
+        uw >= body * 2
+        and
+        lw <= max(body * 0.8, rng * 0.08)
+        and
+        c["close"] < c["open"]
+        and
+        c["close"] <= c["low"] + rng * 0.40
+    ):
+        return True
+
+    return False
+
+
+# ============================================================
+# ENGULFING
+# ============================================================
+
+def bullish_engulfing(candles):
+
+    if len(candles) < 2:
+        return False
+
+    prev = candles[-2]
+    cur = candles[-1]
+
+    if not bearish(prev):
+        return False
+
+    if not bullish(cur):
+        return False
+
+    return (
+        cur["open"] <= prev["close"]
+        and
+        cur["close"] >= prev["open"]
+        and
+        candle_body(cur) >= candle_body(prev) * 0.9
+    )
+
+
+def bearish_engulfing(candles):
+
+    if len(candles) < 2:
+        return False
+
+    prev = candles[-2]
+    cur = candles[-1]
+
+    if not bullish(prev):
+        return False
+
+    if not bearish(cur):
+        return False
+
+    return (
+        cur["open"] >= prev["close"]
+        and
+        cur["close"] <= prev["open"]
+        and
+        candle_body(cur) >= candle_body(prev) * 0.9
+    )
+
+
+# ============================================================
+# MORNING STAR
+# ============================================================
+
+def morning_star(candles):
+
+    if len(candles) < 3:
+        return False
+
+    a = candles[-3]
+    b = candles[-2]
+    c = candles[-1]
+
+    body_a = candle_body(a)
+    body_b = candle_body(b)
+
+    if not bearish(a):
+        return False
+
+    if body_a < candle_range(a) * 0.45:
+        return False
+
+    if body_b > body_a * 0.55:
+        return False
+
+    if not bullish(c):
+        return False
+
+    midpoint_a = (a["open"] + a["close"]) / 2
+
+    return c["close"] > midpoint_a
+
+
+def evening_star(candles):
+
+    if len(candles) < 3:
+        return False
+
+    a = candles[-3]
+    b = candles[-2]
+    c = candles[-1]
+
+    body_a = candle_body(a)
+    body_b = candle_body(b)
+
+    if not bullish(a):
+        return False
+
+    if body_a < candle_range(a) * 0.45:
+        return False
+
+    if body_b > body_a * 0.55:
+        return False
+
+    if not bearish(c):
+        return False
+
+    midpoint_a = (a["open"] + a["close"]) / 2
+
+    return c["close"] < midpoint_a
+
+
+# ============================================================
+# TWEEZER
+# ============================================================
+
+def tweezer_bottom(candles):
+
+    if len(candles) < 2:
+        return False
+
+    a = candles[-2]
+    b = candles[-1]
+
+    atr = calculate_atr(candles, 14)
+
+    if atr is None:
+        atr = candle_range(a)
+
+    same_low = abs(a["low"] - b["low"]) <= atr * 0.15
+
+    return (
+        same_low
+        and
+        bearish(a)
+        and
+        bullish(b)
+    )
+
+
+def tweezer_top(candles):
+
+    if len(candles) < 2:
+        return False
+
+    a = candles[-2]
+    b = candles[-1]
+
+    atr = calculate_atr(candles, 14)
+
+    if atr is None:
+        atr = candle_range(a)
+
+    same_high = abs(a["high"] - b["high"]) <= atr * 0.15
+
+    return (
+        same_high
+        and
+        bullish(a)
+        and
+        bearish(b)
+    )
+
+
+# ============================================================
+# INSIDE BAR
+# ============================================================
+
+def inside_bar(candles):
+
+    if len(candles) < 2:
         return None
 
-    # Use the latest CLOSED candle, not a constantly moving candle.
-    m1c = m1[:-1]
-    m5c = m5[:-1]
-    m15c = m15[:-1]
+    mother = candles[-2]
+    child = candles[-1]
 
-    price = m1c[-1]["close"]
+    if (
+        child["high"] < mother["high"]
+        and
+        child["low"] > mother["low"]
+    ):
+        return "INSIDE BAR"
 
-    # --------------------------------------------------------
-    # MARKET STRUCTURE
-    # --------------------------------------------------------
+    return None
 
-    trend15 = market_structure(m15c)
-    trend5 = market_structure(m5c)
 
-    # --------------------------------------------------------
-    # M5 STRUCTURE
-    # --------------------------------------------------------
+# ============================================================
+# CANDLE PATTERN ANALYZER
+# ============================================================
 
-    buy_sweep = bullish_liquidity_sweep(m5c)
-    sell_sweep = bearish_liquidity_sweep(m5c)
+def analyze_candle_patterns(candles):
 
-    buy_bos = bullish_bos(m5c)
-    sell_bos = bearish_bos(m5c)
+    patterns = []
+    bullish_points = 0
+    bearish_points = 0
 
-    # --------------------------------------------------------
-    # M1 CONFIRMATION
-    # --------------------------------------------------------
+    if len(candles) < 3:
+        return patterns, 0, 0
 
-    m1_last = m1c[-1]
-    m1_prev = m1c[-2]
-
-    buy_rejection = bullish_rejection(m1_last)
-    sell_rejection = bearish_rejection(m1_last)
-
-    buy_engulf = bullish_engulfing(m1_prev, m1_last)
-    sell_engulf = bearish_engulfing(m1_prev, m1_last)
-
-    buy_disp = bullish_displacement(m1c)
-    sell_disp = bearish_displacement(m1c)
+    current = candles[-1]
 
     # --------------------------------------------------------
-    # ATR
+    # BULLISH
     # --------------------------------------------------------
 
-    atr = calculate_atr(m5c, 14)
+    if hammer(current):
+        patterns.append("HAMMER")
+        bullish_points += 3
 
-    if atr is None or atr <= 0:
+    if bullish_pin_bar(current):
+        patterns.append("BULLISH PIN BAR")
+        bullish_points += 3
+
+    if bullish_engulfing(candles):
+        patterns.append("BULLISH ENGULFING")
+        bullish_points += 5
+
+    if morning_star(candles):
+        patterns.append("MORNING STAR")
+        bullish_points += 5
+
+    if tweezer_bottom(candles):
+        patterns.append("TWEEZER BOTTOM")
+        bullish_points += 4
+
+    # --------------------------------------------------------
+    # BEARISH
+    # --------------------------------------------------------
+
+    if shooting_star(current):
+        patterns.append("SHOOTING STAR")
+        bearish_points += 3
+
+    if bearish_pin_bar(current):
+        patterns.append("BEARISH PIN BAR")
+        bearish_points += 3
+
+    if bearish_engulfing(candles):
+        patterns.append("BEARISH ENGULFING")
+        bearish_points += 5
+
+    if evening_star(candles):
+        patterns.append("EVENING STAR")
+        bearish_points += 5
+
+    if tweezer_top(candles):
+        patterns.append("TWEEZER TOP")
+        bearish_points += 4
+
+    # --------------------------------------------------------
+    # INSIDE BAR
+    # --------------------------------------------------------
+
+    ib = inside_bar(candles)
+
+    if ib:
+        patterns.append(ib)
+
+        # Inside bar alone is neutral.
+        # Direction comes from structure/BOS.
+
+    return patterns, bullish_points, bearish_points
+
+
+# ============================================================
+# SCORE CANDLE PATTERNS
+# ============================================================
+
+def pattern_direction(patterns, bullish_points, bearish_points):
+
+    if bullish_points > bearish_points:
+        return "BUY"
+
+    if bearish_points > bullish_points:
+        return "SELL"
+
+    return "NEUTRAL"
+
+
+# ============================================================
+# SETUP ID
+# ============================================================
+
+def create_setup_id(
+    m5,
+    signal,
+    m5_patterns,
+    m1_patterns,
+    sweep,
+    bos
+):
+
+    if not m5:
         return None
 
-    # Avoid abnormal volatility
-    last_range = m5c[-1]["high"] - m5c[-1]["low"]
+    last = m5[-1]
 
-    if last_range > atr * 2.8:
-        return None
+    raw = "|".join([
+        str(last["datetime"]),
+        str(round(last["open"], 2)),
+        str(round(last["high"], 2)),
+        str(round(last["low"], 2)),
+        str(round(last["close"], 2)),
+        str(signal),
+        ",".join(m5_patterns),
+        ",".join(m1_patterns),
+        str(sweep),
+        str(bos)
+    ])
 
-    # ========================================================
-    # BUY SCORE
-    # ========================================================
+    return hashlib.sha256(
+        raw.encode()
+    ).hexdigest()[:16]
+
+
+# ============================================================
+# MAIN ANALYSIS
+# ============================================================
+
+def analyze_pro():
+
+    m1_raw = get_xau_data("1min", 200)
+    m5_raw = get_xau_data("5min", 150)
+    m15_raw = get_xau_data("15min", 100)
+
+    if (
+        len(m1_raw) < 30
+        or
+        len(m5_raw) < 30
+        or
+        len(m15_raw) < 30
+    ):
+        return {
+            "valid": False,
+            "reason": "Not enough market data"
+        }
+
+    # Only closed candles
+    m1 = closed_candles(m1_raw)
+    m5 = closed_candles(m5_raw)
+    m15 = closed_candles(m15_raw)
+
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
+
+    price = m1[-1]["close"]
+
+    # --------------------------------------------------------
+    # STRUCTURE
+    # --------------------------------------------------------
+
+    structure15 = market_structure(m15)
+    structure5 = market_structure(m5)
+
+    # --------------------------------------------------------
+    # BOS
+    # --------------------------------------------------------
+
+    bos5 = detect_bos(m5)
+
+    # --------------------------------------------------------
+    # LIQUIDITY
+    # --------------------------------------------------------
+
+    sweep5 = detect_liquidity_sweep(m5)
+
+    # --------------------------------------------------------
+    # DISPLACEMENT
+    # --------------------------------------------------------
+
+    displacement5 = detect_displacement(m5)
+
+    displacement1 = detect_displacement(m1)
+
+    # --------------------------------------------------------
+    # CANDLE PATTERNS
+    # --------------------------------------------------------
+
+    m5_patterns, m5_bull_points, m5_bear_points = \
+        analyze_candle_patterns(m5)
+
+    m1_patterns, m1_bull_points, m1_bear_points = \
+        analyze_candle_patterns(m1)
+
+    m5_pattern_direction = pattern_direction(
+        m5_patterns,
+        m5_bull_points,
+        m5_bear_points
+    )
+
+    m1_pattern_direction = pattern_direction(
+        m1_patterns,
+        m1_bull_points,
+        m1_bear_points
+    )
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
 
     buy_score = 0
-    buy_reasons = []
-
-    if trend15 == "BULLISH":
-        buy_score += 20
-        buy_reasons.append("M15 bullish structure")
-
-    if trend5 == "BULLISH":
-        buy_score += 15
-        buy_reasons.append("M5 bullish structure")
-
-    if buy_sweep:
-        buy_score += 20
-        buy_reasons.append("M5 sell-side liquidity sweep")
-
-    if buy_bos:
-        buy_score += 15
-        buy_reasons.append("M5 bullish BOS")
-
-    if buy_rejection:
-        buy_score += 10
-        buy_reasons.append("M1 bullish rejection")
-
-    if buy_engulf:
-        buy_score += 10
-        buy_reasons.append("M1 bullish engulfing")
-
-    if buy_disp:
-        buy_score += 10
-        buy_reasons.append("M1 bullish displacement")
-
-    # ========================================================
-    # SELL SCORE
-    # ========================================================
-
     sell_score = 0
-    sell_reasons = []
 
-    if trend15 == "BEARISH":
-        sell_score += 20
-        sell_reasons.append("M15 bearish structure")
-
-    if trend5 == "BEARISH":
-        sell_score += 15
-        sell_reasons.append("M5 bearish structure")
-
-    if sell_sweep:
-        sell_score += 20
-        sell_reasons.append("M5 buy-side liquidity sweep")
-
-    if sell_bos:
-        sell_score += 15
-        sell_reasons.append("M5 bearish BOS")
-
-    if sell_rejection:
-        sell_score += 10
-        sell_reasons.append("M1 bearish rejection")
-
-    if sell_engulf:
-        sell_score += 10
-        sell_reasons.append("M1 bearish engulfing")
-
-    if sell_disp:
-        sell_score += 10
-        sell_reasons.append("M1 bearish displacement")
+    reasons_buy = []
+    reasons_sell = []
 
     # ========================================================
-    # DECIDE
+    # M15 STRUCTURE - 15 POINTS
     # ========================================================
 
-    if buy_score < 80 and sell_score < 80:
-        return {
-            "signal": "NO_TRADE",
-            "score": max(buy_score, sell_score),
-            "price": price,
-            "reason": (
-                f"M15={trend15} | M5={trend5} | "
-                f"BUY={buy_score} SELL={sell_score}"
+    if structure15 == "BULLISH":
+        buy_score += 15
+        reasons_buy.append("M15 bullish structure")
+
+    elif structure15 == "BEARISH":
+        sell_score += 15
+        reasons_sell.append("M15 bearish structure")
+
+    # ========================================================
+    # M5 STRUCTURE - 15 POINTS
+    # ========================================================
+
+    if structure5 == "BULLISH":
+        buy_score += 15
+        reasons_buy.append("M5 bullish structure")
+
+    elif structure5 == "BEARISH":
+        sell_score += 15
+        reasons_sell.append("M5 bearish structure")
+
+    # ========================================================
+    # LIQUIDITY SWEEP - 20 POINTS
+    # ========================================================
+
+    if sweep5 == "BULLISH LIQUIDITY SWEEP":
+        buy_score += 20
+        reasons_buy.append("M5 bullish liquidity sweep")
+
+    elif sweep5 == "BEARISH LIQUIDITY SWEEP":
+        sell_score += 20
+        reasons_sell.append("M5 bearish liquidity sweep")
+
+    # ========================================================
+    # M5 CANDLE PATTERN - MAX 15
+    # ========================================================
+
+    if m5_bull_points > m5_bear_points:
+
+        points = min(15, m5_bull_points)
+
+        buy_score += points
+
+        if m5_patterns:
+            reasons_buy.append(
+                "M5: " + ", ".join(m5_patterns)
             )
-        }
 
-    if buy_score >= 80 and buy_score > sell_score:
+    elif m5_bear_points > m5_bull_points:
 
-        entry = price
+        points = min(15, m5_bear_points)
 
-        # Structure/ATR based SL
-        structure_low = recent_low(m5c, 8)
+        sell_score += points
 
-        sl_distance = max(
-            entry - structure_low + 0.30,
-            atr * 0.9
-        )
+        if m5_patterns:
+            reasons_sell.append(
+                "M5: " + ", ".join(m5_patterns)
+            )
 
-        sl = entry - sl_distance
+    # ========================================================
+    # M1 CANDLE PATTERN - MAX 15
+    # ========================================================
 
-        tp1 = entry + sl_distance * 1.5
-        tp2 = entry + sl_distance * 2.3
+    if m1_bull_points > m1_bear_points:
+
+        points = min(15, m1_bull_points)
+
+        buy_score += points
+
+        if m1_patterns:
+            reasons_buy.append(
+                "M1: " + ", ".join(m1_patterns)
+            )
+
+    elif m1_bear_points > m1_bull_points:
+
+        points = min(15, m1_bear_points)
+
+        sell_score += points
+
+        if m1_patterns:
+            reasons_sell.append(
+                "M1: " + ", ".join(m1_patterns)
+            )
+
+    # ========================================================
+    # BOS - 10 POINTS
+    # ========================================================
+
+    if bos5 == "BULLISH BOS":
+
+        buy_score += 10
+        reasons_buy.append("M5 bullish BOS")
+
+    elif bos5 == "BEARISH BOS":
+
+        sell_score += 10
+        reasons_sell.append("M5 bearish BOS")
+
+    # ========================================================
+    # DISPLACEMENT - 5 POINTS
+    # ========================================================
+
+    if displacement5 == "BULLISH DISPLACEMENT":
+
+        buy_score += 5
+        reasons_buy.append("M5 bullish displacement")
+
+    elif displacement5 == "BEARISH DISPLACEMENT":
+
+        sell_score += 5
+        reasons_sell.append("M5 bearish displacement")
+
+    # M1 displacement is used as confirmation,
+    # but does not add another score to avoid double counting.
+
+    # ========================================================
+    # DETERMINE SIGNAL
+    # ========================================================
+
+    signal = "NO TRADE"
+    score = max(buy_score, sell_score)
+    reasons = []
+
+    if buy_score >= MIN_SCORE and buy_score > sell_score:
+
+        signal = "BUY"
+        score = buy_score
+        reasons = reasons_buy
+
+    elif sell_score >= MIN_SCORE and sell_score > buy_score:
+
+        signal = "SELL"
+        score = sell_score
+        reasons = reasons_sell
+
+    # ========================================================
+    # ATR / SL / TP
+    # ========================================================
+
+    atr = calculate_atr(m5, 14)
+
+    if atr is None:
 
         return {
-            "signal": "BUY",
-            "score": buy_score,
-            "price": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "atr": atr,
-            "trend15": trend15,
-            "trend5": trend5,
-            "reasons": buy_reasons
+            "valid": False,
+            "reason": "ATR unavailable"
         }
 
-    if sell_score >= 80 and sell_score > buy_score:
+    # ========================================================
+    # RISK MODEL
+    # ========================================================
 
-        entry = price
+    if signal == "BUY":
 
-        structure_high = recent_high(m5c, 8)
-
-        sl_distance = max(
-            structure_high - entry + 0.30,
-            atr * 0.9
+        # Use recent M5 swing low
+        swing_low = min(
+            x["low"] for x in m5[-8:]
         )
 
-        sl = entry + sl_distance
+        sl = swing_low - atr * 0.15
 
-        tp1 = entry - sl_distance * 1.5
-        tp2 = entry - sl_distance * 2.3
+        risk = price - sl
 
-        return {
-            "signal": "SELL",
-            "score": sell_score,
-            "price": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "atr": atr,
-            "trend15": trend15,
-            "trend5": trend5,
-            "reasons": sell_reasons
-        }
+        if risk <= 0:
+            risk = atr * 1.2
+            sl = price - risk
+
+        tp1 = price + risk * 1.5
+        tp2 = price + risk * 2.3
+
+    elif signal == "SELL":
+
+        swing_high = max(
+            x["high"] for x in m5[-8:]
+        )
+
+        sl = swing_high + atr * 0.15
+
+        risk = sl - price
+
+        if risk <= 0:
+            risk = atr * 1.2
+            sl = price + risk
+
+        tp1 = price - risk * 1.5
+        tp2 = price - risk * 2.3
+
+    else:
+
+        sl = None
+        tp1 = None
+        tp2 = None
+        risk = None
+
+    # ========================================================
+    # SETUP ID
+    # ========================================================
+
+    setup_id = create_setup_id(
+        m5,
+        signal,
+        m5_patterns,
+        m1_patterns,
+        sweep5,
+        bos5
+    )
 
     return {
-        "signal": "NO_TRADE",
-        "score": max(buy_score, sell_score),
+        "valid": True,
+
+        "signal": signal,
+        "score": score,
+
         "price": price,
-        "reason": "Conflicting BUY/SELL structure"
+
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+
+        "risk": risk,
+
+        "atr": atr,
+
+        "structure15": structure15,
+        "structure5": structure5,
+
+        "bos": bos5,
+        "sweep": sweep5,
+
+        "displacement5": displacement5,
+        "displacement1": displacement1,
+
+        "m5_patterns": m5_patterns,
+        "m1_patterns": m1_patterns,
+
+        "m5_pattern_direction": m5_pattern_direction,
+        "m1_pattern_direction": m1_pattern_direction,
+
+        "reasons": reasons,
+
+        "setup_id": setup_id,
+
+        "time": m1[-1]["datetime"]
     }
 
 
 # ============================================================
-# FORMAT TELEGRAM SIGNAL
+# FORMAT SIGNAL
 # ============================================================
 
-def format_signal(r):
+def format_signal(a, same_setup=False):
 
-    sig = r["signal"]
+    if not a["valid"]:
 
-    if sig == "BUY":
+        return (
+            "⚠️ DATA ERROR\n\n"
+            f"{a['reason']}"
+        )
+
+    signal = a["signal"]
+
+    if signal == "BUY":
         emoji = "🟢"
-    else:
+    elif signal == "SELL":
         emoji = "🔴"
+    else:
+        emoji = "⚪"
 
-    reasons = "\n".join(
-        f"✓ {x}" for x in r["reasons"]
-    )
-
-    return (
-        f"{emoji} XAUUSD PRO SCALP {sig}\n"
-        f"🔥 CONFLUENCE: {r['score']}/100\n\n"
-        f"Entry: ${r['price']:.2f}\n"
-        f"SL:    ${r['sl']:.2f}\n"
-        f"TP1:   ${r['tp1']:.2f}\n"
-        f"TP2:   ${r['tp2']:.2f}\n\n"
-        f"M15: {r['trend15']}\n"
-        f"M5:  {r['trend5']}\n\n"
-        f"{reasons}\n\n"
-        f"⚠️ LOT: 0.01 ONLY\n"
-        f"⚠️ Signal is candle-structure based."
-    )
-
-
-# ============================================================
-# SCANNER
-# ============================================================
-
-def run_scan():
-
-    global LAST_SIGNAL_CANDLE
-    global LAST_SIGNAL
-    global LAST_ALERT_TIME
-
-    m1 = get_xau_data("1min", 120)
-    m5 = get_xau_data("5min", 120)
-    m15 = get_xau_data("15min", 120)
-
-    if not m1 or not m5 or not m15:
-        logging.warning("Not enough market data")
-        return
-
-    result = analyze_pro(m1, m5, m15)
-
-    if not result:
-        return
-
-    logging.info(
-        f"Analysis: {result['signal']} "
-        f"{result.get('score', 0)}/100"
-    )
-
-    if result["signal"] not in ["BUY", "SELL"]:
-        return
-
-    score = result["score"]
-
-    if score < 80:
-        return
-
-    # Candle ID prevents repeated alert on same setup
-    candle_id = m1[-2]["datetime"]
-
-    # Don't send identical signal repeatedly
-    if candle_id == LAST_SIGNAL_CANDLE and result["signal"] == LAST_SIGNAL:
-        return
-
-    # Minimum 10-minute cooldown
-    if time.time() - LAST_ALERT_TIME < 600:
-        return
-
-    text = format_signal(result)
-
-    if send_message(TELEGRAM_CHAT_ID, text):
-        LAST_SIGNAL_CANDLE = candle_id
-        LAST_SIGNAL = result["signal"]
-        LAST_ALERT_TIME = time.time()
-
-        logging.info(
-            f"ALERT SENT: {result['signal']} "
-            f"{result['score']}/100"
-        )
-
-
-def auto_scanner():
-
-    logging.info(
-        "CANDLE STRUCTURE PRO SCALPER V1 STARTED"
-    )
-
-    # Give Flask/Render a moment to start
-    time.sleep(10)
-
-    while True:
-
-        try:
-
-            if is_trading_window():
-                run_scan()
-            else:
-                logging.info("Outside trading window")
-
-            # Scan every minute
-            time.sleep(60)
-
-        except Exception as e:
-
-            logging.error(
-                f"Scanner error: {e}"
-            )
-
-            time.sleep(30)
-
-
-# ============================================================
-# FLASK
-# ============================================================
-
-@app.route("/")
-def home():
-
-    return (
-        "Candle Structure Pro Scalper V1 "
-        "running"
-    )
-
-
-@app.route("/telegram", methods=["POST"])
-def telegram_webhook():
-
-    try:
-
-        data = request.get_json()
-
-        if not data:
-            return "ok"
-
-        if "message" not in data:
-            return "ok"
-
-        message = data["message"]
-
-        if "text" not in message:
-            return "ok"
-
-        text = message["text"].strip().lower()
-
-        chat_id = message["chat"]["id"]
-
-        # Manual signal command
-        if text.startswith("/signal"):
-
-            m1 = get_xau_data("1min", 120)
-            m5 = get_xau_data("5min", 120)
-            m15 = get_xau_data("15min", 120)
-
-            result = analyze_pro(
-                m1,
-                m5,
-                m15
-            )
-
-            if not result:
-
-                send_message(
-                    chat_id,
-                    "⚠️ DATA ERROR — TRY AGAIN"
-                )
-
-                return "ok"
-
-            if result["signal"] in ["BUY", "SELL"]:
-
-                send_message(
-                    chat_id,
-                    format_signal(result)
-                )
-
-            else:
-
-                send_message(
-                    chat_id,
-                    (
-                        "⚪ NO TRADE\n\n"
-                        f"Current structure:\n"
-                        f"{result['reason']}\n\n"
-                        "Waiting for stronger confluence."
-                    )
-                )
-
-        elif text == "/start":
-
-            send_message(
-                chat_id,
-                (
-                    "🤖 Candle Structure Pro Scalper V1\n\n"
-                    "Commands:\n"
-                    "/signal — analyze XAUUSD now\n\n"
-                    "Automatic scanner is ON."
-                )
-            )
-
-        return "ok"
-
-    except Exception as e:
-
-        logging.error(
-            f"Webhook error: {e}"
-        )
-
-        return "ok"
-
-
-# ============================================================
-# START SCANNER
-# ============================================================
-
-threading.Thread(
-    target=auto_scanner,
-    daemon=True
-).start()
-
-
-# ============================================================
-# START FLASK
-# ============================================================
-
-if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    text

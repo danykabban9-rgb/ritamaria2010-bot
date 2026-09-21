@@ -14,31 +14,21 @@ from flask import Flask, request
 
 SYMBOL = "XAU/USD"
 
-# Continuous scanning
 SCAN_SECONDS = 60
 
-# Signal threshold
-MIN_SCORE = 78
+# Active scalper thresholds
+WATCH_SCORE = 50
+ENTRY_SCORE = 60
 
-# Developing setup threshold
-WATCH_SCORE = 55
-
-# Small account protection
 LOT_SIZE = "0.01 ONLY"
 
-# Duplicate signal protection
-LAST_SIGNAL_HASH = None
-LAST_SIGNAL_TIME = None
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 
-# Latest candles
-LAST_M1_CANDLE = None
-LAST_M5_CANDLE = None
-LAST_M15_CANDLE = None
-
-
-# ============================================================
-# FLASK
-# ============================================================
+LAST_M1 = None
+LAST_SIGNAL_ID = None
+LAST_WATCH_ID = None
 
 app = Flask(__name__)
 
@@ -49,74 +39,48 @@ logging.basicConfig(
 
 
 # ============================================================
-# ENVIRONMENT
-# ============================================================
-
-def get_env():
-    return (
-        os.getenv("TELEGRAM_TOKEN"),
-        os.getenv("TELEGRAM_CHAT_ID"),
-        os.getenv("TWELVE_DATA_KEY")
-    )
-
-
-# ============================================================
 # TELEGRAM
 # ============================================================
 
 def send_telegram(message, chat_id=None):
 
-    telegram_token, default_chat_id, _ = get_env()
+    token = TELEGRAM_TOKEN
+    target = chat_id or TELEGRAM_CHAT_ID
 
-    if not telegram_token:
-        logging.error("TELEGRAM_TOKEN is missing.")
-        return False
-
-    target_chat_id = (
-        chat_id
-        if chat_id is not None
-        else default_chat_id
-    )
-
-    if not target_chat_id:
-        logging.error("Telegram chat ID missing.")
+    if not token or not target:
+        logging.error("Telegram configuration missing.")
         return False
 
     url = (
         f"https://api.telegram.org/"
-        f"bot{telegram_token}/sendMessage"
+        f"bot{token}/sendMessage"
     )
-
-    payload = {
-        "chat_id": target_chat_id,
-        "text": message
-    }
 
     try:
 
-        response = requests.post(
+        r = requests.post(
             url,
-            json=payload,
+            json={
+                "chat_id": target,
+                "text": message
+            },
             timeout=15
         )
 
-        if response.status_code != 200:
+        if r.status_code != 200:
 
             logging.error(
-                "Telegram error %s: %s",
-                response.status_code,
-                response.text
+                "Telegram error: %s",
+                r.text
             )
 
             return False
-
-        logging.info("Telegram message sent.")
 
         return True
 
     except Exception as e:
 
-        logging.exception(
+        logging.error(
             "Telegram exception: %s",
             e
         )
@@ -128,14 +92,12 @@ def send_telegram(message, chat_id=None):
 # TWELVE DATA
 # ============================================================
 
-def get_candles(interval, outputsize=160):
+def get_candles(interval, outputsize=120):
 
-    _, _, twelve_data_key = get_env()
-
-    if not twelve_data_key:
+    if not TWELVE_DATA_KEY:
 
         logging.error(
-            "TWELVE_DATA_KEY is missing."
+            "TWELVE_DATA_KEY missing."
         )
 
         return []
@@ -146,27 +108,27 @@ def get_candles(interval, outputsize=160):
         "symbol": SYMBOL,
         "interval": interval,
         "outputsize": outputsize,
-        "apikey": twelve_data_key,
+        "apikey": TWELVE_DATA_KEY,
         "timezone": "UTC",
         "order": "desc"
     }
 
     try:
 
-        response = requests.get(
+        r = requests.get(
             url,
             params=params,
             timeout=20
         )
 
-        response.raise_for_status()
+        r.raise_for_status()
 
-        data = response.json()
+        data = r.json()
 
         if data.get("status") == "error":
 
             logging.error(
-                "Twelve Data %s error: %s",
+                "Twelve Data %s: %s",
                 interval,
                 data.get("message")
             )
@@ -176,61 +138,48 @@ def get_candles(interval, outputsize=160):
         values = data.get("values", [])
 
         if not isinstance(values, list):
-
-            logging.error(
-                "Invalid Twelve Data values: %s",
-                interval
-            )
-
             return []
 
         candles = []
 
-        for item in values:
+        for x in values:
 
             try:
 
-                candle = {
-                    "datetime": str(item["datetime"]),
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"])
-                }
-
-                if candle["high"] < candle["low"]:
-                    continue
-
-                candles.append(candle)
+                candles.append({
+                    "datetime": str(x["datetime"]),
+                    "open": float(x["open"]),
+                    "high": float(x["high"]),
+                    "low": float(x["low"]),
+                    "close": float(x["close"])
+                })
 
             except (
                 KeyError,
                 TypeError,
                 ValueError
             ):
+
                 continue
 
         if len(candles) < 30:
 
             logging.error(
-                "%s: only %d valid candles",
+                "%s incomplete: %d candles",
                 interval,
                 len(candles)
             )
 
             return []
 
-        # Twelve Data normally returns newest first.
-        # First candle may still be forming.
-        # Remove it and use closed candles only.
+        # newest candle can be forming
+        candles = candles[1:]
 
-        if len(candles) > 1:
-            candles = candles[1:]
-
+        # oldest -> newest
         candles.reverse()
 
         logging.info(
-            "%s | %d closed candles | latest=%s | "
+            "%s | %d closed | latest=%s | "
             "O=%.2f H=%.2f L=%.2f C=%.2f",
             interval,
             len(candles),
@@ -243,20 +192,10 @@ def get_candles(interval, outputsize=160):
 
         return candles
 
-    except requests.RequestException as e:
-
-        logging.error(
-            "Twelve Data network error %s: %s",
-            interval,
-            e
-        )
-
-        return []
-
     except Exception as e:
 
-        logging.exception(
-            "Twelve Data exception %s: %s",
+        logging.error(
+            "Data error %s: %s",
             interval,
             e
         )
@@ -268,36 +207,36 @@ def get_candles(interval, outputsize=160):
 # CANDLE FUNCTIONS
 # ============================================================
 
-def candle_body(c):
+def body(c):
     return abs(c["close"] - c["open"])
 
 
-def candle_range(c):
+def rng(c):
     return max(
         c["high"] - c["low"],
         0.00001
     )
 
 
-def upper_wick(c):
+def upper(c):
     return (
         c["high"]
         - max(c["open"], c["close"])
     )
 
 
-def lower_wick(c):
+def lower(c):
     return (
         min(c["open"], c["close"])
         - c["low"]
     )
 
 
-def is_bullish(c):
+def bull(c):
     return c["close"] > c["open"]
 
 
-def is_bearish(c):
+def bear(c):
     return c["close"] < c["open"]
 
 
@@ -305,7 +244,7 @@ def is_bearish(c):
 # ATR
 # ============================================================
 
-def calculate_atr(candles, period=14):
+def atr(candles, period=14):
 
     if len(candles) < period + 1:
         return None
@@ -314,80 +253,359 @@ def calculate_atr(candles, period=14):
 
     for i in range(1, len(candles)):
 
-        current = candles[i]
-        previous = candles[i - 1]
+        c = candles[i]
+        p = candles[i - 1]
 
         tr = max(
-            current["high"] - current["low"],
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-            abs(
-                current["low"]
-                - previous["close"]
-            )
+            c["high"] - c["low"],
+            abs(c["high"] - p["close"]),
+            abs(c["low"] - p["close"])
         )
 
         trs.append(tr)
 
-    return sum(trs[-period:]) / period
+    return sum(
+        trs[-period:]
+    ) / period
 
 
 # ============================================================
 # STRUCTURE
 # ============================================================
 
-def structure_direction(candles, lookback=20):
+def structure(candles, lookback=20):
 
     if len(candles) < lookback:
-        return "NEUTRAL"
+        return "RANGE"
 
-    recent = candles[-lookback:]
+    x = candles[-lookback:]
 
-    first = recent[:10]
-    second = recent[10:]
+    half = lookback // 2
 
-    first_high = max(
-        c["high"] for c in first
-    )
+    a = x[:half]
+    b = x[half:]
 
-    second_high = max(
-        c["high"] for c in second
-    )
+    ah = max(c["high"] for c in a)
+    al = min(c["low"] for c in a)
 
-    first_low = min(
-        c["low"] for c in first
-    )
+    bh = max(c["high"] for c in b)
+    bl = min(c["low"] for c in b)
 
-    second_low = min(
-        c["low"] for c in second
-    )
-
-    if (
-        second_high > first_high
-        and second_low > first_low
-    ):
+    if bh > ah and bl > al:
         return "BULLISH"
 
-    if (
-        second_high < first_high
-        and second_low < first_low
-    ):
+    if bh < ah and bl < al:
         return "BEARISH"
 
     return "RANGE"
 
 
 # ============================================================
-# BOS
+# LOCAL SWINGS
 # ============================================================
 
-def detect_bos(candles):
+def recent_high(candles, n=6):
+
+    return max(
+        c["high"]
+        for c in candles[-n:]
+    )
+
+
+def recent_low(candles, n=6):
+
+    return min(
+        c["low"]
+        for c in candles[-n:]
+    )
+
+
+# ============================================================
+# LIQUIDITY SWEEP
+# ============================================================
+
+def sweep(candles):
+
+    if len(candles) < 10:
+        return "NONE"
+
+    c = candles[-1]
+
+    reference = candles[-8:-1]
+
+    high = max(
+        x["high"]
+        for x in reference
+    )
+
+    low = min(
+        x["low"]
+        for x in reference
+    )
+
+    # SELL-side liquidity taken,
+    # then price closes back above it
+    if (
+        c["low"] < low
+        and c["close"] > low
+    ):
+        return "BULLISH"
+
+    # BUY-side liquidity taken,
+    # then price closes back below it
+    if (
+        c["high"] > high
+        and c["close"] < high
+    ):
+        return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# REJECTION
+# ============================================================
+
+def rejection(c):
+
+    r = rng(c)
+    b = body(c)
+
+    if (
+        lower(c) >= max(b * 1.4, r * 0.30)
+        and c["close"] > c["low"] + r * 0.55
+    ):
+        return "BULLISH"
+
+    if (
+        upper(c) >= max(b * 1.4, r * 0.30)
+        and c["close"] < c["high"] - r * 0.55
+    ):
+        return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# ENGULFING
+# ============================================================
+
+def engulfing(candles):
+
+    if len(candles) < 2:
+        return "NONE"
+
+    p = candles[-2]
+    c = candles[-1]
+
+    if (
+        bear(p)
+        and bull(c)
+        and c["open"] <= p["close"]
+        and c["close"] >= p["open"]
+    ):
+        return "BULLISH"
+
+    if (
+        bull(p)
+        and bear(c)
+        and c["open"] >= p["close"]
+        and c["close"] <= p["open"]
+    ):
+        return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# DISPLACEMENT
+# ============================================================
+
+def displacement(candles):
 
     if len(candles) < 12:
         return "NONE"
 
-    current = candles[-1]
+    c = candles[-1]
 
-    reference = candles[-8:-1
+    avg = sum(
+        rng(x)
+        for x in candles[-11:-1]
+    ) / 10
+
+    cr = rng(c)
+
+    if cr < avg * 1.20:
+        return "NONE"
+
+    if (
+        bull(c)
+        and body(c) >= cr * 0.60
+    ):
+        return "BULLISH"
+
+    if (
+        bear(c)
+        and body(c) >= cr * 0.60
+    ):
+        return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# MICRO BOS
+# ============================================================
+
+def micro_bos(candles):
+
+    if len(candles) < 8:
+        return "NONE"
+
+    c = candles[-1]
+
+    previous = candles[-5:-1]
+
+    h = max(
+        x["high"]
+        for x in previous
+    )
+
+    l = min(
+        x["low"]
+        for x in previous
+    )
+
+    if c["close"] > h:
+        return "BULLISH"
+
+    if c["close"] < l:
+        return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# PULLBACK
+# ============================================================
+
+def pullback_signal(candles, direction):
+
+    if len(candles) < 5:
+        return False
+
+    last = candles[-1]
+    previous = candles[-4:-1]
+
+    if direction == "BUY":
+
+        had_bearish = any(
+            bear(x)
+            for x in previous
+        )
+
+        return (
+            had_bearish
+            and bull(last)
+            and last["close"] > previous[-1]["close"]
+        )
+
+    if direction == "SELL":
+
+        had_bullish = any(
+            bull(x)
+            for x in previous
+        )
+
+        return (
+            had_bullish
+            and bear(last)
+            and last["close"] < previous[-1]["close"]
+        )
+
+    return False
+
+
+# ============================================================
+# BREAKOUT
+# ============================================================
+
+def breakout(candles):
+
+    if len(candles) < 10:
+        return "NONE"
+
+    c = candles[-1]
+
+    reference = candles[-8:-1]
+
+    high = max(
+        x["high"]
+        for x in reference
+    )
+
+    low = min(
+        x["low"]
+        for x in reference
+    )
+
+    if (
+        c["close"] > high
+        and body(c) >= rng(c) * 0.55
+    ):
+        return "BULLISH"
+
+    if (
+        c["close"] < low
+        and body(c) >= rng(c) * 0.55
+    ):
+        return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# SCORE ENGINE
+# ============================================================
+
+def analyze(m1, m5, m15):
+
+    if (
+        len(m1) < 30
+        or len(m5) < 30
+        or len(m15) < 30
+    ):
+        return None
+
+    m5_structure = structure(m5)
+    m15_structure = structure(m15)
+
+    sw = sweep(m1)
+    rej = rejection(m1[-1])
+    eng = engulfing(m1)
+    disp = displacement(m1)
+    bos = micro_bos(m1)
+    brk = breakout(m1)
+
+    buy = 0
+    sell = 0
+
+    buy_reasons = []
+    sell_reasons = []
+
+    # --------------------------------------------------------
+    # M5 CONTEXT
+    # --------------------------------------------------------
+
+    if m5_structure == "BULLISH":
+
+        buy += 12
+        buy_reasons.append("M5 bullish")
+
+    elif m5_structure == "BEARISH":
+
+        sell += 12
+        sell_reasons.append("M5 bearish")
+
+    # --------------------------------------------------------
+    # M15 BACKGROUND ONLY

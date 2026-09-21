@@ -4,11 +4,10 @@ import threading
 import logging
 import requests
 from flask import Flask, request
-from datetime import datetime
 import pytz
 
 # ============================================================
-# RENDER VARIABLES
+# CONFIG
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -18,19 +17,11 @@ TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 BEIRUT_TZ = pytz.timezone("Asia/Beirut")
 app = Flask(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
-# ============================================================
-# SETTINGS
-# ============================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 MIN_SCORE = 70
 STRONG_SCORE = 80
 ALERT_COOLDOWN = 300  # 5 minutes
-
 LAST_AUTO_ALERT_TIME = 0
 
 # ============================================================
@@ -42,10 +33,8 @@ def send_message(chat_id, text):
         if not TELEGRAM_TOKEN or not chat_id:
             logging.error("Telegram config missing")
             return False
-
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         response = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
-
         if response.status_code != 200:
             logging.error(f"Telegram error: {response.text}")
             return False
@@ -55,14 +44,7 @@ def send_message(chat_id, text):
         return False
 
 # ============================================================
-# TRADING WINDOW (REMOVED)
-# ============================================================
-
-def is_trading_window():
-    return True  # Always allow signals
-
-# ============================================================
-# SIGNAL GENERATION (Auto Mode)
+# SIGNAL GENERATION
 # ============================================================
 
 def generate_signal(candles):
@@ -138,3 +120,38 @@ def generate_signal(candles):
         Score: {score_sell}
         {msg_sell}
         Entry: {last_close}
+        SL: {sl}
+        TP: {tp}
+        RRR: {rrr}:1
+        """
+        send_message(TELEGRAM_CHAT_ID, signal_text)
+        LAST_AUTO_ALERT_TIME = now
+
+# ============================================================
+# MANUAL SIGNAL REPLY
+# ============================================================
+
+@app.route("/signal", methods=["POST"])
+def manual_signal():
+    data = request.json
+    text = data.get("text", "")
+    if text:
+        send_message(TELEGRAM_CHAT_ID, f"📢 Manual Signal: {text}")
+        return {"status": "ok"}
+    return {"status": "error", "message": "No text provided"}
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def run_bot():
+    while True:
+        candles = get_xau_data("5min")
+        if candles:
+            generate_signal(candles)
+        time.sleep(60)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))  # ✅ Correct binding for Render
+    threading.Thread(target=run_bot, daemon=True).start()
+    app.run(host="0.0.0.0", port=port)

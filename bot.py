@@ -14,18 +14,23 @@ from flask import Flask, request
 
 SYMBOL = "XAU/USD"
 
-# Scan continuously — NO TIME FILTER
+# Continuous scanning - NO TIME FILTER
 SCAN_SECONDS = 60
 
-# Minimum setup score
+# Strong setup threshold
 MIN_SCORE = 78
 
-# Small-account protection
+# Small account
 LOT_SIZE = "0.01 ONLY"
 
-# Prevent duplicate alerts
+# Duplicate signal protection
 LAST_SIGNAL_HASH = None
 LAST_SIGNAL_TIME = None
+
+# Remember latest market candles
+LAST_M1_CANDLE = None
+LAST_M5_CANDLE = None
+LAST_M15_CANDLE = None
 
 
 # ============================================================
@@ -46,14 +51,10 @@ logging.basicConfig(
 
 def get_env():
 
-    telegram_token = os.getenv("TELEGRAM_TOKEN")
-    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    twelve_data_key = os.getenv("TWELVE_DATA_KEY")
-
     return (
-        telegram_token,
-        telegram_chat_id,
-        twelve_data_key
+        os.getenv("TELEGRAM_TOKEN"),
+        os.getenv("TELEGRAM_CHAT_ID"),
+        os.getenv("TWELVE_DATA_KEY")
     )
 
 
@@ -66,11 +67,7 @@ def send_telegram(message, chat_id=None):
     telegram_token, default_chat_id, _ = get_env()
 
     if not telegram_token:
-
-        logging.error(
-            "TELEGRAM_TOKEN is missing."
-        )
-
+        logging.error("TELEGRAM_TOKEN is missing.")
         return False
 
     target_chat_id = (
@@ -80,11 +77,7 @@ def send_telegram(message, chat_id=None):
     )
 
     if not target_chat_id:
-
-        logging.error(
-            "No Telegram chat ID available."
-        )
-
+        logging.error("No Telegram chat ID available.")
         return False
 
     url = (
@@ -115,9 +108,7 @@ def send_telegram(message, chat_id=None):
 
             return False
 
-        logging.info(
-            "Telegram message sent successfully."
-        )
+        logging.info("Telegram message sent successfully.")
 
         return True
 
@@ -147,9 +138,7 @@ def get_candles(interval, outputsize=160):
 
         return []
 
-    url = (
-        "https://api.twelvedata.com/time_series"
-    )
+    url = "https://api.twelvedata.com/time_series"
 
     params = {
         "symbol": SYMBOL,
@@ -175,7 +164,7 @@ def get_candles(interval, outputsize=160):
         if not isinstance(data, dict):
 
             logging.error(
-                "Invalid Twelve Data response for %s",
+                "Invalid Twelve Data response: %s",
                 interval
             )
 
@@ -191,21 +180,18 @@ def get_candles(interval, outputsize=160):
 
             return []
 
-        values = data.get(
-            "values",
-            []
-        )
+        values = data.get("values", [])
 
         if not isinstance(values, list):
 
             logging.error(
-                "Twelve Data values is not a list: %s",
+                "Invalid values for %s",
                 interval
             )
 
             return []
 
-        raw_candles = []
+        candles = []
 
         for item in values:
 
@@ -214,33 +200,18 @@ def get_candles(interval, outputsize=160):
 
             try:
 
-                candle = {
-                    "datetime": str(
-                        item["datetime"]
-                    ),
-                    "open": float(
-                        item["open"]
-                    ),
-                    "high": float(
-                        item["high"]
-                    ),
-                    "low": float(
-                        item["low"]
-                    ),
-                    "close": float(
-                        item["close"]
-                    )
+                c = {
+                    "datetime": str(item["datetime"]),
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"])
                 }
 
-                if (
-                    candle["high"]
-                    < candle["low"]
-                ):
+                if c["high"] < c["low"]:
                     continue
 
-                raw_candles.append(
-                    candle
-                )
+                candles.append(c)
 
             except (
                 KeyError,
@@ -250,35 +221,39 @@ def get_candles(interval, outputsize=160):
 
                 continue
 
-        if len(raw_candles) < 3:
+        if len(candles) < 30:
 
             logging.error(
-                "Not enough valid candles for %s",
-                interval
+                "%s: only %d valid candles",
+                interval,
+                len(candles)
             )
 
             return []
 
-        # Twelve Data returns newest first.
+        # ----------------------------------------------------
+        # Twelve Data normally returns newest first.
         #
-        # The first candle can be the currently forming
-        # candle. Remove it so the strategy works only with
-        # confirmed/closed candles.
-        #
-        # Then reverse to oldest -> newest.
+        # We remove the first candle because it may still
+        # be forming, then reverse into oldest -> newest.
+        # ----------------------------------------------------
 
-        closed_candles = raw_candles[1:]
+        closed = candles[1:]
 
-        closed_candles.reverse()
+        closed.reverse()
 
         logging.info(
-            "%s closed candles: %d | latest=%s",
+            "%s | candles=%d | latest=%s | O=%.2f H=%.2f L=%.2f C=%.2f",
             interval,
-            len(closed_candles),
-            closed_candles[-1]["datetime"]
+            len(closed),
+            closed[-1]["datetime"],
+            closed[-1]["open"],
+            closed[-1]["high"],
+            closed[-1]["low"],
+            closed[-1]["close"]
         )
 
-        return closed_candles
+        return closed
 
     except requests.RequestException as e:
 
@@ -324,20 +299,14 @@ def upper_wick(c):
 
     return (
         c["high"]
-        - max(
-            c["open"],
-            c["close"]
-        )
+        - max(c["open"], c["close"])
     )
 
 
 def lower_wick(c):
 
     return (
-        min(
-            c["open"],
-            c["close"]
-        )
+        min(c["open"], c["close"])
         - c["low"]
     )
 
@@ -363,19 +332,10 @@ def average_range(candles, period=14):
 
     recent = candles[-period:]
 
-    try:
-
-        return (
-            sum(
-                candle_range(c)
-                for c in recent
-            )
-            / period
-        )
-
-    except Exception:
-
-        return None
+    return (
+        sum(candle_range(c) for c in recent)
+        / period
+    )
 
 
 # ============================================================
@@ -389,175 +349,162 @@ def structure_direction(candles):
 
     recent = candles[-20:]
 
-    highs = [
-        c["high"]
-        for c in recent
-    ]
+    first = recent[:10]
+    second = recent[10:]
 
-    lows = [
-        c["low"]
-        for c in recent
-    ]
+    first_high = max(c["high"] for c in first)
+    second_high = max(c["high"] for c in second)
 
-    first_high = max(
-        highs[:10]
-    )
-
-    second_high = max(
-        highs[10:]
-    )
-
-    first_low = min(
-        lows[:10]
-    )
-
-    second_low = min(
-        lows[10:]
-    )
+    first_low = min(c["low"] for c in first)
+    second_low = min(c["low"] for c in second)
 
     if (
         second_high > first_high
         and second_low > first_low
     ):
-
         return "BULLISH"
 
     if (
         second_high < first_high
         and second_low < first_low
     ):
-
         return "BEARISH"
 
     return "RANGE"
 
 
 # ============================================================
-# BREAK OF STRUCTURE
+# MORE DYNAMIC BOS
 # ============================================================
 
 def detect_bos(candles):
 
-    if len(candles) < 12:
+    if len(candles) < 15:
         return "NONE"
-
-    reference = candles[-7:-1]
 
     current = candles[-1]
 
+    reference = candles[-8:-1]
+
     previous_high = max(
-        c["high"]
-        for c in reference
+        c["high"] for c in reference
     )
 
     previous_low = min(
-        c["low"]
-        for c in reference
+        c["low"] for c in reference
     )
 
+    # Require a real close beyond structure
     if current["close"] > previous_high:
-
         return "BULLISH"
 
     if current["close"] < previous_low:
-
         return "BEARISH"
 
     return "NONE"
 
 
 # ============================================================
-# LIQUIDITY SWEEP
+# RECENT LIQUIDITY SWEEP
 # ============================================================
 
 def liquidity_sweep(candles):
 
-    if len(candles) < 12:
+    if len(candles) < 15:
         return "NONE"
 
-    current = candles[-1]
+    # Check the last 3 closed candles.
+    # This avoids depending only on candles[-1].
 
-    previous = candles[-7:-1]
-
-    previous_high = max(
-        c["high"]
-        for c in previous
-    )
-
-    previous_low = min(
-        c["low"]
-        for c in previous
-    )
-
-    # Bullish liquidity sweep:
-    # price takes previous low and closes back above it
-
-    if (
-        current["low"] < previous_low
-        and current["close"] > previous_low
+    for index in range(
+        len(candles) - 3,
+        len(candles)
     ):
 
-        return "BULLISH"
+        current = candles[index]
 
-    # Bearish liquidity sweep:
-    # price takes previous high and closes back below it
+        start = max(0, index - 7)
 
-    if (
-        current["high"] > previous_high
-        and current["close"] < previous_high
-    ):
+        previous = candles[start:index]
 
-        return "BEARISH"
+        if len(previous) < 4:
+            continue
+
+        previous_high = max(
+            c["high"] for c in previous
+        )
+
+        previous_low = min(
+            c["low"] for c in previous
+        )
+
+        # Bullish sweep
+        if (
+            current["low"] < previous_low
+            and current["close"] > previous_low
+        ):
+
+            return "BULLISH"
+
+        # Bearish sweep
+        if (
+            current["high"] > previous_high
+            and current["close"] < previous_high
+        ):
+
+            return "BEARISH"
 
     return "NONE"
 
 
 # ============================================================
-# REJECTION CANDLE
+# REJECTION
 # ============================================================
 
 def rejection_signal(c):
 
     if not isinstance(c, dict):
-
         return "NONE"
 
     rng = candle_range(c)
 
     body = candle_body(c)
 
-    if rng <= 0:
-
-        return "NONE"
-
-    # Ignore extremely small dojis
     if body <= rng * 0.05:
-
         return "NONE"
 
     lw = lower_wick(c)
-
     uw = upper_wick(c)
-
-    # Bullish rejection
 
     if (
         lw >= body * 1.5
         and lw >= uw * 1.5
-        and c["close"] > c["open"]
+        and is_bullish(c)
     ):
-
         return "BULLISH"
-
-    # Bearish rejection
 
     if (
         uw >= body * 1.5
         and uw >= lw * 1.5
-        and c["close"] < c["open"]
+        and is_bearish(c)
     ):
-
         return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# RECENT REJECTION
+# ============================================================
+
+def recent_rejection(candles):
+
+    for c in candles[-3:]:
+
+        result = rejection_signal(c)
+
+        if result != "NONE":
+            return result
 
     return "NONE"
 
@@ -569,38 +516,52 @@ def rejection_signal(c):
 def engulfing_signal(candles):
 
     if len(candles) < 2:
-
         return "NONE"
 
     previous = candles[-2]
-
     current = candles[-1]
-
-    # Bullish engulfing
 
     if (
         is_bearish(previous)
         and is_bullish(current)
-        and current["open"]
-        <= previous["close"]
-        and current["close"]
-        >= previous["open"]
+        and current["open"] <= previous["close"]
+        and current["close"] >= previous["open"]
     ):
 
         return "BULLISH"
 
-    # Bearish engulfing
-
     if (
         is_bullish(previous)
         and is_bearish(current)
-        and current["open"]
-        >= previous["close"]
-        and current["close"]
-        <= previous["open"]
+        and current["open"] >= previous["close"]
+        and current["close"] <= previous["open"]
     ):
 
         return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# CHECK RECENT ENGULFING
+# ============================================================
+
+def recent_engulfing(candles):
+
+    if len(candles) < 4:
+        return "NONE"
+
+    for i in range(
+        len(candles) - 3,
+        len(candles)
+    ):
+
+        pair = candles[:i + 1]
+
+        result = engulfing_signal(pair)
+
+        if result != "NONE":
+            return result
 
     return "NONE"
 
@@ -612,7 +573,6 @@ def engulfing_signal(candles):
 def displacement(candles):
 
     if len(candles) < 16:
-
         return "NONE"
 
     current = candles[-1]
@@ -623,26 +583,43 @@ def displacement(candles):
     )
 
     if not avg:
-
         return "NONE"
 
-    current_range = candle_range(
-        current
-    )
+    rng = candle_range(current)
 
-    # Strong expansion candle
+    if rng < avg * 1.35:
+        return "NONE"
 
-    if current_range < avg * 1.5:
-
+    # Require meaningful body
+    if candle_body(current) / rng < 0.60:
         return "NONE"
 
     if is_bullish(current):
-
         return "BULLISH"
 
     if is_bearish(current):
-
         return "BEARISH"
+
+    return "NONE"
+
+
+# ============================================================
+# RECENT DISPLACEMENT
+# ============================================================
+
+def recent_displacement(candles):
+
+    for i in range(
+        max(16, len(candles) - 3),
+        len(candles)
+    ):
+
+        subset = candles[:i + 1]
+
+        result = displacement(subset)
+
+        if result != "NONE":
+            return result
 
     return "NONE"
 
@@ -654,7 +631,6 @@ def displacement(candles):
 def calculate_atr(candles, period=14):
 
     if len(candles) < period + 1:
-
         return None
 
     true_ranges = []
@@ -665,18 +641,14 @@ def calculate_atr(candles, period=14):
     ):
 
         current = candles[i]
-
         previous = candles[i - 1]
 
         tr = max(
-            current["high"]
-            - current["low"],
-
+            current["high"] - current["low"],
             abs(
                 current["high"]
                 - previous["close"]
             ),
-
             abs(
                 current["low"]
                 - previous["close"]
@@ -685,20 +657,14 @@ def calculate_atr(candles, period=14):
 
         true_ranges.append(tr)
 
-    if len(true_ranges) < period:
-
-        return None
-
     return (
-        sum(
-            true_ranges[-period:]
-        )
+        sum(true_ranges[-period:])
         / period
     )
 
 
 # ============================================================
-# M1 CANDLE QUALITY
+# CANDLE QUALITY
 # ============================================================
 
 def directional_candle_quality(c):
@@ -707,25 +673,19 @@ def directional_candle_quality(c):
 
     body = candle_body(c)
 
-    if rng <= 0:
-
-        return 0
-
     ratio = body / rng
 
     if ratio >= 0.70:
-
         return 2
 
     if ratio >= 0.50:
-
         return 1
 
     return 0
 
 
 # ============================================================
-# FULL MARKET ANALYSIS
+# MARKET ANALYSIS
 # ============================================================
 
 def analyze_market(
@@ -739,208 +699,160 @@ def analyze_market(
         or len(m5) < 30
         or len(m1) < 30
     ):
-
-        logging.warning(
-            "Insufficient candle history."
-        )
-
         return None
 
-    # ========================================================
-    # HIGHER-TIMEFRAME STRUCTURE
-    # ========================================================
+    # --------------------------------------------------------
+    # STRUCTURE
+    # --------------------------------------------------------
 
-    m15_direction = structure_direction(
-        m15
-    )
+    m15_direction = structure_direction(m15)
 
-    m5_direction = structure_direction(
-        m5
-    )
+    m5_direction = structure_direction(m5)
 
-    m5_bos = detect_bos(
-        m5
-    )
+    m5_bos = detect_bos(m5)
 
-    # ========================================================
-    # M1 CANDLE EXPERT
-    # ========================================================
+    # --------------------------------------------------------
+    # M1
+    # --------------------------------------------------------
 
-    latest_m1 = m1[-1]
+    latest = m1[-1]
 
-    m1_sweep = liquidity_sweep(
-        m1
-    )
+    sweep = liquidity_sweep(m1)
 
-    # IMPORTANT:
-    # One candle is passed here.
-    # This fixes the original TypeError.
+    rejection = recent_rejection(m1)
 
-    m1_rejection = rejection_signal(
-        latest_m1
-    )
+    engulfing = recent_engulfing(m1)
 
-    m1_engulfing = engulfing_signal(
-        m1
-    )
+    displace = recent_displacement(m1)
 
-    m1_displacement = displacement(
-        m1
-    )
+    quality = directional_candle_quality(latest)
 
-    m1_quality = directional_candle_quality(
-        latest_m1
-    )
-
-    atr = calculate_atr(
-        m1
-    )
+    atr = calculate_atr(m1)
 
     if not atr:
-
         return None
 
-    # ========================================================
+    # --------------------------------------------------------
     # SCORE
-    # ========================================================
+    # --------------------------------------------------------
 
-    score_buy = 0
-    score_sell = 0
+    buy = 0
+    sell = 0
 
-    # M15 = primary directional context
-
+    # M15
     if m15_direction == "BULLISH":
-
-        score_buy += 20
+        buy += 20
 
     elif m15_direction == "BEARISH":
+        sell += 20
 
-        score_sell += 20
-
-    # M5 = intermediate structure
-
+    # M5
     if m5_direction == "BULLISH":
-
-        score_buy += 15
+        buy += 15
 
     elif m5_direction == "BEARISH":
+        sell += 15
 
-        score_sell += 15
-
-    # M5 BOS
-
+    # BOS
     if m5_bos == "BULLISH":
-
-        score_buy += 20
+        buy += 20
 
     elif m5_bos == "BEARISH":
+        sell += 20
 
-        score_sell += 20
+    # Sweep
+    if sweep == "BULLISH":
+        buy += 20
 
-    # M1 liquidity
+    elif sweep == "BEARISH":
+        sell += 20
 
-    if m1_sweep == "BULLISH":
+    # Rejection
+    if rejection == "BULLISH":
+        buy += 10
 
-        score_buy += 20
+    elif rejection == "BEARISH":
+        sell += 10
 
-    elif m1_sweep == "BEARISH":
+    # Engulfing
+    if engulfing == "BULLISH":
+        buy += 10
 
-        score_sell += 20
+    elif engulfing == "BEARISH":
+        sell += 10
 
-    # M1 rejection
+    # Displacement
+    if displace == "BULLISH":
+        buy += 10
 
-    if m1_rejection == "BULLISH":
+    elif displace == "BEARISH":
+        sell += 10
 
-        score_buy += 10
+    # Candle quality
+    if quality:
 
-    elif m1_rejection == "BEARISH":
+        if is_bullish(latest):
+            buy += quality
 
-        score_sell += 10
+        elif is_bearish(latest):
+            sell += quality
 
-    # M1 engulfing
-
-    if m1_engulfing == "BULLISH":
-
-        score_buy += 10
-
-    elif m1_engulfing == "BEARISH":
-
-        score_sell += 10
-
-    # M1 displacement
-
-    if m1_displacement == "BULLISH":
-
-        score_buy += 10
-
-    elif m1_displacement == "BEARISH":
-
-        score_sell += 10
-
-    # ========================================================
-    # EXTRA CANDLE QUALITY
-    # ========================================================
-
-    if m1_quality > 0:
-
-        if is_bullish(latest_m1):
-
-            score_buy += m1_quality
-
-        elif is_bearish(latest_m1):
-
-            score_sell += m1_quality
-
-    # ========================================================
-    # DIRECTION
-    # ========================================================
+    # --------------------------------------------------------
+    # DETERMINE DIRECTION
+    # --------------------------------------------------------
 
     if (
-        score_buy >= MIN_SCORE
-        and score_buy > score_sell
+        buy >= MIN_SCORE
+        and buy > sell
     ):
 
         direction = "BUY"
-
-        score = score_buy
+        score = buy
 
     elif (
-        score_sell >= MIN_SCORE
-        and score_sell > score_buy
+        sell >= MIN_SCORE
+        and sell > buy
     ):
 
         direction = "SELL"
-
-        score = score_sell
+        score = sell
 
     else:
 
         return {
             "direction": "NONE",
-            "score": max(
-                score_buy,
-                score_sell
-            ),
+            "score": max(buy, sell),
+            "buy_score": buy,
+            "sell_score": sell,
+
             "m15": m15_direction,
             "m5": m5_direction,
             "bos": m5_bos,
-            "sweep": m1_sweep,
-            "rejection": m1_rejection,
-            "engulfing": m1_engulfing,
-            "displacement": m1_displacement,
-            "quality": m1_quality,
-            "atr": atr
+
+            "sweep": sweep,
+            "rejection": rejection,
+            "engulfing": engulfing,
+            "displacement": displace,
+
+            "quality": quality,
+            "atr": atr,
+
+            "candle_time": latest["datetime"],
+            "open": latest["open"],
+            "high": latest["high"],
+            "low": latest["low"],
+            "close": latest["close"]
         }
 
-    # ========================================================
+    # --------------------------------------------------------
     # ENTRY
-    # ========================================================
+    # --------------------------------------------------------
 
-    entry = latest_m1["close"]
+    entry = latest["close"]
 
-    # ========================================================
-    # STOP / TARGET
-    # ========================================================
+    # --------------------------------------------------------
+    # SL / TP
+    # --------------------------------------------------------
 
     if direction == "BUY":
 
@@ -957,18 +869,10 @@ def analyze_market(
         risk = entry - sl
 
         if risk <= 0:
-
             return None
 
-        tp1 = (
-            entry
-            + risk * 1.5
-        )
-
-        tp2 = (
-            entry
-            + risk * 2.2
-        )
+        tp1 = entry + risk * 1.5
+        tp2 = entry + risk * 2.2
 
     else:
 
@@ -985,36 +889,41 @@ def analyze_market(
         risk = sl - entry
 
         if risk <= 0:
-
             return None
 
-        tp1 = (
-            entry
-            - risk * 1.5
-        )
-
-        tp2 = (
-            entry
-            - risk * 2.2
-        )
+        tp1 = entry - risk * 1.5
+        tp2 = entry - risk * 2.2
 
     return {
         "direction": direction,
         "score": score,
+
+        "buy_score": buy,
+        "sell_score": sell,
+
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
+
         "atr": atr,
+
         "m15": m15_direction,
         "m5": m5_direction,
         "bos": m5_bos,
-        "sweep": m1_sweep,
-        "rejection": m1_rejection,
-        "engulfing": m1_engulfing,
-        "displacement": m1_displacement,
-        "quality": m1_quality,
-        "candle_time": latest_m1["datetime"]
+
+        "sweep": sweep,
+        "rejection": rejection,
+        "engulfing": engulfing,
+        "displacement": displace,
+
+        "quality": quality,
+
+        "candle_time": latest["datetime"],
+        "open": latest["open"],
+        "high": latest["high"],
+        "low": latest["low"],
+        "close": latest["close"]
     }
 
 
@@ -1031,13 +940,11 @@ def format_signal(s):
     )
 
     risk = abs(
-        s["entry"]
-        - s["sl"]
+        s["entry"] - s["sl"]
     )
 
     reward = abs(
-        s["tp2"]
-        - s["entry"]
+        s["tp2"] - s["entry"]
     )
 
     rr = (
@@ -1058,44 +965,28 @@ def format_signal(s):
         f"RR: 1:{rr:.2f}\n"
         f"SCORE: {s['score']}/100\n\n"
 
-        f"M15 STRUCTURE: "
-        f"{s['m15']}\n"
+        f"M15: {s['m15']}\n"
+        f"M5:  {s['m5']}\n"
+        f"BOS: {s['bos']}\n\n"
 
-        f"M5 STRUCTURE:  "
-        f"{s['m5']}\n"
-
-        f"M5 BOS:        "
-        f"{s['bos']}\n\n"
-
-        f"M1 LIQUIDITY:  "
-        f"{s['sweep']}\n"
-
-        f"M1 REJECTION:  "
-        f"{s['rejection']}\n"
-
-        f"M1 ENGULFING:  "
-        f"{s['engulfing']}\n"
-
-        f"M1 DISPLACE:   "
-        f"{s['displacement']}\n"
-
-        f"M1 QUALITY:    "
-        f"{s['quality']}/2\n\n"
+        f"M1 SWEEP:      {s['sweep']}\n"
+        f"M1 REJECTION:  {s['rejection']}\n"
+        f"M1 ENGULFING:  {s['engulfing']}\n"
+        f"M1 DISPLACE:   {s['displacement']}\n"
+        f"M1 QUALITY:    {s['quality']}/2\n\n"
 
         f"ATR: {s['atr']:.2f}\n"
 
-        f"CANDLE: "
-        f"{s['candle_time']}\n\n"
+        f"CANDLE: {s['candle_time']}\n\n"
 
         f"LOT: {LOT_SIZE}\n\n"
 
-        "⚠️ SIGNAL ONLY — "
-        "MANUAL EXECUTION"
+        "⚠️ SIGNAL ONLY — MANUAL EXECUTION"
     )
 
 
 # ============================================================
-# NO TRADE
+# NO TRADE FORMAT
 # ============================================================
 
 def format_no_trade(s):
@@ -1106,29 +997,26 @@ def format_no_trade(s):
         "Candle structure is not "
         "strong enough yet.\n\n"
 
-        f"SCORE: "
-        f"{s.get('score', 0)}/100\n\n"
+        f"SCORE: {s.get('score', 0)}/100\n"
+        f"BUY SCORE: {s.get('buy_score', 0)}\n"
+        f"SELL SCORE: {s.get('sell_score', 0)}\n\n"
 
-        f"M15: "
-        f"{s.get('m15', 'N/A')}\n"
+        f"M15: {s.get('m15', 'N/A')}\n"
+        f"M5:  {s.get('m5', 'N/A')}\n"
+        f"BOS: {s.get('bos', 'N/A')}\n\n"
 
-        f"M5:  "
-        f"{s.get('m5', 'N/A')}\n"
+        f"M1 Sweep:       {s.get('sweep', 'N/A')}\n"
+        f"M1 Rejection:   {s.get('rejection', 'N/A')}\n"
+        f"M1 Engulfing:   {s.get('engulfing', 'N/A')}\n"
+        f"M1 Displacement:{s.get('displacement', 'N/A')}\n\n"
 
-        f"BOS: "
-        f"{s.get('bos', 'N/A')}\n\n"
+        f"M1 CANDLE: "
+        f"{s.get('candle_time', 'N/A')}\n"
 
-        f"M1 Sweep: "
-        f"{s.get('sweep', 'N/A')}\n"
-
-        f"M1 Rejection: "
-        f"{s.get('rejection', 'N/A')}\n"
-
-        f"M1 Engulfing: "
-        f"{s.get('engulfing', 'N/A')}\n"
-
-        f"M1 Displacement: "
-        f"{s.get('displacement', 'N/A')}\n\n"
+        f"O: {s.get('open', 0):.2f}  "
+        f"H: {s.get('high', 0):.2f}  "
+        f"L: {s.get('low', 0):.2f}  "
+        f"C: {s.get('close', 0):.2f}\n\n"
 
         "Waiting for a stronger "
         "candle/structure setup."
@@ -1165,29 +1053,17 @@ def scan(
 
     global LAST_SIGNAL_HASH
     global LAST_SIGNAL_TIME
+    global LAST_M1_CANDLE
+    global LAST_M5_CANDLE
+    global LAST_M15_CANDLE
 
     logging.info(
-        "Starting XAUUSD scan..."
+        "========== NEW XAUUSD SCAN =========="
     )
 
-    # --------------------------------------------------------
-    # GET CLOSED CANDLES
-    # --------------------------------------------------------
-
-    m15 = get_candles(
-        "15min",
-        160
-    )
-
-    m5 = get_candles(
-        "5min",
-        160
-    )
-
-    m1 = get_candles(
-        "1min",
-        160
-    )
+    m15 = get_candles("15min", 160)
+    m5 = get_candles("5min", 160)
+    m1 = get_candles("1min", 160)
 
     if (
         len(m15) < 30
@@ -1196,8 +1072,7 @@ def scan(
     ):
 
         logging.error(
-            "Incomplete market data: "
-            "M15=%d M5=%d M1=%d",
+            "Incomplete data M15=%d M5=%d M1=%d",
             len(m15),
             len(m5),
             len(m1)
@@ -1207,12 +1082,46 @@ def scan(
 
             send_telegram(
                 "⚠️ XAUUSD\n\n"
-                "Market data is incomplete. "
-                "Try again in a moment.",
+                "Market data incomplete.",
                 chat_id
             )
 
         return
+
+    # --------------------------------------------------------
+    # FRESHNESS CHECK
+    # --------------------------------------------------------
+
+    latest_m1 = m1[-1]
+    latest_m5 = m5[-1]
+    latest_m15 = m15[-1]
+
+    old_m1 = LAST_M1_CANDLE
+    old_m5 = LAST_M5_CANDLE
+    old_m15 = LAST_M15_CANDLE
+
+    LAST_M1_CANDLE = latest_m1["datetime"]
+    LAST_M5_CANDLE = latest_m5["datetime"]
+    LAST_M15_CANDLE = latest_m15["datetime"]
+
+    logging.info(
+        "MARKET TIME | M1=%s | M5=%s | M15=%s",
+        LAST_M1_CANDLE,
+        LAST_M5_CANDLE,
+        LAST_M15_CANDLE
+    )
+
+    if old_m1 == LAST_M1_CANDLE:
+
+        logging.info(
+            "M1 candle unchanged since previous scan."
+        )
+
+    else:
+
+        logging.info(
+            "NEW CLOSED M1 CANDLE DETECTED."
+        )
 
     # --------------------------------------------------------
     # ANALYZE
@@ -1234,8 +1143,7 @@ def scan(
 
             send_telegram(
                 "⚠️ XAUUSD\n\n"
-                "The candle data could not "
-                "produce a valid setup.",
+                "Unable to produce a valid setup.",
                 chat_id
             )
 
@@ -1248,57 +1156,52 @@ def scan(
     if result["direction"] == "NONE":
 
         logging.info(
-            "No setup | score=%s",
-            result["score"]
+            "NO TRADE | score=%s | buy=%s | sell=%s | M1=%s",
+            result["score"],
+            result["buy_score"],
+            result["sell_score"],
+            result["candle_time"]
         )
 
         if send_no_trade:
 
             send_telegram(
-                format_no_trade(
-                    result
-                ),
+                format_no_trade(result),
                 chat_id
             )
 
         return
 
     # --------------------------------------------------------
-    # DUPLICATE PROTECTION
+    # DUPLICATE SIGNAL PROTECTION
     # --------------------------------------------------------
 
-    current_hash = signal_hash(
-        result
-    )
+    current_hash = signal_hash(result)
 
     if current_hash == LAST_SIGNAL_HASH:
 
         logging.info(
-            "Same setup already sent."
+            "Same signal already sent."
         )
 
         return
 
     LAST_SIGNAL_HASH = current_hash
-
     LAST_SIGNAL_TIME = time.time()
 
     # --------------------------------------------------------
-    # SEND SIGNAL
+    # SEND
     # --------------------------------------------------------
 
-    message = format_signal(
-        result
-    )
-
     logging.info(
-        "VALID SIGNAL: %s | SCORE=%s",
+        "VALID SIGNAL %s | score=%s | candle=%s",
         result["direction"],
-        result["score"]
+        result["score"],
+        result["candle_time"]
     )
 
     send_telegram(
-        message,
+        format_signal(result),
         chat_id
     )
 
@@ -1322,6 +1225,10 @@ def scanner_loop():
     )
 
     logging.info(
+        "CONTINUOUS SCANNING: ON"
+    )
+
+    logging.info(
         "SCAN INTERVAL: %s seconds",
         SCAN_SECONDS
     )
@@ -1329,6 +1236,11 @@ def scanner_loop():
     logging.info(
         "MINIMUM SCORE: %s",
         MIN_SCORE
+    )
+
+    logging.info(
+        "LOT: %s",
+        LOT_SIZE
     )
 
     logging.info(
@@ -1354,7 +1266,7 @@ def scanner_loop():
 
 
 # ============================================================
-# TELEGRAM WEBHOOK
+# HOME
 # ============================================================
 
 @app.route(
@@ -1368,6 +1280,10 @@ def home():
         200
     )
 
+
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
 
 @app.route(
     "/telegram",
@@ -1389,11 +1305,7 @@ def telegram_webhook():
             {}
         )
 
-        if not isinstance(
-            message,
-            dict
-        ):
-
+        if not isinstance(message, dict):
             return "OK", 200
 
         text = message.get(
@@ -1401,11 +1313,7 @@ def telegram_webhook():
             ""
         )
 
-        if not isinstance(
-            text,
-            str
-        ):
-
+        if not isinstance(text, str):
             return "OK", 200
 
         text = text.strip()
@@ -1415,12 +1323,9 @@ def telegram_webhook():
             {}
         )
 
-        chat_id = chat.get(
-            "id"
-        )
+        chat_id = chat.get("id")
 
         if not text:
-
             return "OK", 200
 
         logging.info(
@@ -1429,45 +1334,43 @@ def telegram_webhook():
             chat_id
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # START
-        # ====================================================
+        # ----------------------------------------------------
 
-        if text.startswith(
-            "/start"
-        ):
+        if text.startswith("/start"):
 
             send_telegram(
 
                 "🟡 XAUUSD GOLD "
                 "CANDLE EXPERT BOT\n\n"
 
-                "🟢 Bot is online.\n"
-                "🟢 No time restriction.\n"
-                "🟢 Continuous scanning.\n\n"
+                "🟢 ONLINE\n"
+                "🟢 NO TIME FILTER\n"
+                "🟢 CONTINUOUS SCANNING\n"
+                "🟢 M1/M5/M15 ANALYSIS\n\n"
 
                 "Commands:\n"
-                "/signal — analyze now\n"
-                "/status — bot status",
+                "/signal - analyze now\n"
+                "/status - bot status\n"
+                "/debug - market data",
 
                 chat_id
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # SIGNAL
-        # ====================================================
+        # ----------------------------------------------------
 
-        elif text.startswith(
-            "/signal"
-        ):
+        elif text.startswith("/signal"):
 
             send_telegram(
 
                 "🔎 XAUUSD SCAN\n\n"
-                "Analyzing:\n"
-                "M15 structure\n"
-                "M5 structure + BOS\n"
-                "M1 liquidity + candle patterns\n\n"
+                "Reading fresh M15/M5/M1 data...\n"
+                "Checking candle structure...\n"
+                "Checking liquidity...\n"
+                "Checking BOS...\n\n"
                 "Please wait...",
 
                 chat_id
@@ -1478,17 +1381,13 @@ def telegram_webhook():
                 chat_id=chat_id
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # STATUS
-        # ====================================================
+        # ----------------------------------------------------
 
-        elif text.startswith(
-            "/status"
-        ):
+        elif text.startswith("/status"):
 
-            telegram_token, _, twelve_key = (
-                get_env()
-            )
+            telegram_token, _, twelve_key = get_env()
 
             telegram_status = (
                 "OK"
@@ -1510,34 +1409,87 @@ def telegram_webhook():
 
             send_telegram(
 
-                "🟢 XAUUSD BOT ONLINE\n\n"
+                "🟢 XAUUSD BOT STATUS\n\n"
 
                 "TIME FILTER: OFF\n"
-                "CONTINUOUS SCAN: ON\n\n"
+                "CONTINUOUS SCAN: ON\n"
 
-                f"Scan interval: "
-                f"{SCAN_SECONDS}s\n"
+                f"SCAN: {SCAN_SECONDS}s\n"
+                f"MIN SCORE: {MIN_SCORE}\n"
+                f"LOT: {LOT_SIZE}\n\n"
 
-                f"Minimum score: "
-                f"{MIN_SCORE}/100\n"
+                f"Telegram API: {telegram_status}\n"
+                f"Twelve Data: {data_status}\n\n"
 
-                f"Lot: {LOT_SIZE}\n\n"
+                f"LAST M1: "
+                f"{LAST_M1_CANDLE or 'NOT READ'}\n"
 
-                f"Telegram API: "
-                f"{telegram_status}\n"
+                f"LAST M5: "
+                f"{LAST_M5_CANDLE or 'NOT READ'}\n"
 
-                f"Twelve Data: "
-                f"{data_status}\n\n"
+                f"LAST M15: "
+                f"{LAST_M15_CANDLE or 'NOT READ'}\n\n"
 
-                f"Last signal: "
-                f"{last_signal}",
+                f"LAST SIGNAL: {last_signal}",
 
                 chat_id
             )
 
-        # ====================================================
-        # UNKNOWN COMMAND
-        # ====================================================
+        # ----------------------------------------------------
+        # DEBUG
+        # ----------------------------------------------------
+
+        elif text.startswith("/debug"):
+
+            m15 = get_candles("15min", 40)
+            m5 = get_candles("5min", 40)
+            m1 = get_candles("1min", 40)
+
+            if not m1 or not m5 or not m15:
+
+                send_telegram(
+                    "⚠️ DEBUG\n\n"
+                    "Unable to retrieve market data.",
+                    chat_id
+                )
+
+                return "OK", 200
+
+            a = m1[-1]
+            b = m5[-1]
+            c = m15[-1]
+
+            send_telegram(
+
+                "🔧 XAUUSD DEBUG\n\n"
+
+                "M1\n"
+                f"Time: {a['datetime']}\n"
+                f"O: {a['open']:.2f}\n"
+                f"H: {a['high']:.2f}\n"
+                f"L: {a['low']:.2f}\n"
+                f"C: {a['close']:.2f}\n\n"
+
+                "M5\n"
+                f"Time: {b['datetime']}\n"
+                f"O: {b['open']:.2f}\n"
+                f"H: {b['high']:.2f}\n"
+                f"L: {b['low']:.2f}\n"
+                f"C: {b['close']:.2f}\n\n"
+
+                "M15\n"
+                f"Time: {c['datetime']}\n"
+                f"O: {c['open']:.2f}\n"
+                f"H: {c['high']:.2f}\n"
+                f"L: {c['low']:.2f}\n"
+                f"C: {c['close']:.2f}",
+
+                chat_id
+            )
+
+        # ----------------------------------------------------
+        # UNKNOWN
+        # ----------------------------------------------------
 
         else:
 
@@ -1545,10 +1497,10 @@ def telegram_webhook():
 
                 "Unknown command.\n\n"
 
-                "Available commands:\n"
                 "/start\n"
                 "/signal\n"
-                "/status",
+                "/status\n"
+                "/debug",
 
                 chat_id
             )
@@ -1566,7 +1518,7 @@ def telegram_webhook():
 
 
 # ============================================================
-# START
+# START APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
@@ -1575,7 +1527,6 @@ if __name__ == "__main__":
         "Starting XAUUSD Telegram Bot..."
     )
 
-    # Start scanner
     scanner_thread = threading.Thread(
         target=scanner_loop,
         daemon=True
@@ -1583,7 +1534,6 @@ if __name__ == "__main__":
 
     scanner_thread.start()
 
-    # Render supplies PORT
     port = int(
         os.getenv(
             "PORT",

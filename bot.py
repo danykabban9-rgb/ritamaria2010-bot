@@ -5,7 +5,8 @@ import logging
 import hashlib
 import requests
 
-from flask import Flask, jsonify
+from datetime import datetime, timezone
+from flask import Flask, request, jsonify
 
 
 # ============================================================
@@ -23,7 +24,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 
-TWELVE_URL = "https://api.twelvedata.com/time_series"
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 
 app = Flask(__name__)
 
@@ -32,99 +33,126 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
 LAST_AUTO_SETUP_ID = None
 LAST_MANUAL_SETUP_ID = None
-LAST_UPDATE_ID = 0
-
-START_TIME = time.time()
-LAST_HEARTBEAT = 0
-
-# Prevent overlapping market analysis
-ANALYSIS_LOCK = threading.Lock()
-
-# Prevent simultaneous Twelve Data requests
-TWELVE_REQUEST_LOCK = threading.Lock()
 
 
 # ============================================================
-# MARKET DATA CACHE
+# TELEGRAM
 # ============================================================
 
-DATA_CACHE = {
-    "1min": {
-        "candles": [],
-        "time": 0
-    },
-    "5min": {
-        "candles": [],
-        "time": 0
-    },
-    "15min": {
-        "candles": [],
-        "time": 0
-    }
-}
-
-CACHE_LOCK = threading.Lock()
-
-CACHE_TTL = {
-    "1min": 55,
-    "5min": 240,
-    "15min": 840
-}
-
-
-# ============================================================
-# TWELVE DATA BACKOFF
-# ============================================================
-
-TWELVE_BACKOFF_UNTIL = 0
-TWELVE_BACKOFF_SECONDS = 90
-
-
-# ============================================================
-# BASIC CONFIG
-# ============================================================
-
-def config_ok():
-
-    return bool(
-        TELEGRAM_TOKEN
-        and TELEGRAM_CHAT_ID
-        and TWELVE_DATA_KEY
-    )
-
-
-# ============================================================
-# TELEGRAM API
-# ============================================================
-
-def telegram_api(method, data=None, timeout=10):
-
-    if not TELEGRAM_TOKEN:
-        return None
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("Telegram variables are missing.")
+        return False
 
     url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/{method}"
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_TOKEN}/sendMessage"
     )
 
-    try:
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
 
+    try:
         response = requests.post(
             url,
-            data=data or {},
-            timeout=timeout
+            json=payload,
+            timeout=15
         )
 
-        if not response.ok:
-
+        if response.status_code != 200:
             logging.error(
-                "Telegram HTTP %s: %s",
-                response.status_code,
-                response
+                "Telegram error: %s",
+                response.text
+            )
+            return False
+
+        return True
+
+    except Exception as e:
+        logging.error(
+            "Telegram connection error: %s",
+            e
+        )
+        return False
+
+
+# ============================================================
+# TWELVE DATA
+# ============================================================
+
+def get_candles(interval, outputsize=100):
+    if not TWELVE_DATA_KEY:
+        logging.error("TWELVE_DATA_KEY is missing.")
+        return []
+
+    params = {
+        "symbol": SYMBOL,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_KEY,
+        "format": "JSON"
+    }
+
+    try:
+        response = requests.get(
+            TWELVE_DATA_URL,
+            params=params,
+            timeout=20
+        )
+
+        if response.status_code != 200:
+            logging.error(
+                "Twelve Data HTTP error: %s",
+                response.status_code
+            )
+            return []
+
+        data = response.json()
+
+        if "values" not in data:
+            logging.error(
+                "Twelve Data response: %s",
+                data
+            )
+            return []
+
+        candles = []
+
+        for item in reversed(data["values"]):
+            try:
+                candles.append({
+                    "time": item["datetime"],
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"])
+                })
+            except (KeyError, ValueError):
+                continue
+
+        return candles
+
+    except Exception as e:
+        logging.error(
+            "Twelve Data connection error: %s",
+            e
+        )
+        return []
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return None
+
+    true_ranges = []
+
+    for i in range(1, len(candles)):
+        current =

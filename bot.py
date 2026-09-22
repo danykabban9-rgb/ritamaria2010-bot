@@ -1,4 +1,3 @@
-
 import os
 import time
 import threading
@@ -25,6 +24,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+
 TELEGRAM_API = (
     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     if TELEGRAM_TOKEN
@@ -43,7 +43,6 @@ LAST_MANUAL_SETUP_ID = None
 
 TELEGRAM_OFFSET = 0
 
-# Prevent two scans from running at the same time
 SCAN_LOCK = threading.Lock()
 
 
@@ -52,8 +51,13 @@ SCAN_LOCK = threading.Lock()
 # ============================================================
 
 def send_telegram(message):
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Telegram variables are missing.")
+
+        logging.error(
+            "Telegram variables are missing."
+        )
+
         return False
 
     url = f"{TELEGRAM_API}/sendMessage"
@@ -64,6 +68,7 @@ def send_telegram(message):
     }
 
     try:
+
         response = requests.post(
             url,
             json=payload,
@@ -71,31 +76,37 @@ def send_telegram(message):
         )
 
         if response.status_code != 200:
+
             logging.error(
                 "Telegram send error: %s",
                 response.text
             )
+
             return False
 
         return True
 
     except requests.RequestException as e:
+
         logging.error(
             "Telegram connection error: %s",
             e
         )
+
         return False
 
     except Exception as e:
+
         logging.exception(
             "Telegram unexpected error: %s",
             e
         )
+
         return False
 
 
 # ============================================================
-# TELEGRAM POLLING
+# TELEGRAM COMMAND PROCESSOR
 # ============================================================
 
 def process_telegram_command(text_message):
@@ -110,10 +121,10 @@ def process_telegram_command(text_message):
         if text_message.startswith("/start"):
 
             send_telegram(
-                "🟢 XAUUSD Candle Expert ONLINE\n\n"
+                "🟢 XAUUSD CANDLE EXPERT ONLINE\n\n"
                 "Commands:\n"
-                "/signal - scan gold now\n"
-                "/status - bot status"
+                "/signal - Full gold analysis\n"
+                "/status - Bot status"
             )
 
         elif text_message.startswith("/status"):
@@ -122,42 +133,41 @@ def process_telegram_command(text_message):
                 "🟢 BOT ONLINE\n\n"
                 f"Symbol: {SYMBOL}\n"
                 f"Scan: every {SCAN_SECONDS}s\n"
-                f"Minimum score: {MIN_SCORE}\n"
-                f"Lot: {LOT_SIZE}"
+                f"Minimum signal score: {MIN_SCORE}\n"
+                f"Lot: {LOT_SIZE}\n\n"
+                "Mode: Candle Structure Expert"
             )
 
         elif text_message.startswith("/signal"):
 
-            logging.info("Manual /signal received.")
+            logging.info(
+                "Manual /signal received."
+            )
 
-            setup = analyze_market()
+            result = analyze_market()
 
-            if not setup:
+            if not result:
 
                 send_telegram(
-                    "⏳ NO HIGH-QUALITY SETUP\n\n"
-                    "The candle structure does not "
-                    "currently meet the 80-point "
-                    "confirmation threshold.\n\n"
-                    "No trade."
+                    "⚠️ ANALYSIS FAILED\n\n"
+                    "Market data could not be analyzed."
                 )
 
                 return
 
-            current_id = setup_id(setup)
+            message = format_analysis_report(
+                result
+            )
 
-            message = format_signal(setup)
+            send_telegram(message)
 
-            if current_id == LAST_MANUAL_SETUP_ID:
+            setup = result.get("setup")
 
-                message = (
-                    "ℹ️ SAME SETUP\n\n"
-                    + message
+            if setup:
+
+                LAST_MANUAL_SETUP_ID = setup_id(
+                    setup
                 )
-
-            if send_telegram(message):
-
-                LAST_MANUAL_SETUP_ID = current_id
 
                 logging.info(
                     "Manual signal sent: %s",
@@ -172,6 +182,10 @@ def process_telegram_command(text_message):
         )
 
 
+# ============================================================
+# TELEGRAM POLLING
+# ============================================================
+
 def telegram_polling():
 
     global TELEGRAM_OFFSET
@@ -179,8 +193,7 @@ def telegram_polling():
     if not TELEGRAM_TOKEN:
 
         logging.error(
-            "TELEGRAM_TOKEN missing. "
-            "Telegram polling cannot start."
+            "TELEGRAM_TOKEN missing."
         )
 
         return
@@ -189,7 +202,6 @@ def telegram_polling():
         "Telegram polling started."
     )
 
-    # Remove old webhook so getUpdates works.
     try:
 
         requests.post(
@@ -234,6 +246,7 @@ def telegram_polling():
                 )
 
                 time.sleep(5)
+
                 continue
 
             data = response.json()
@@ -241,11 +254,12 @@ def telegram_polling():
             if not data.get("ok"):
 
                 logging.error(
-                    "Telegram API returned error: %s",
+                    "Telegram API error: %s",
                     data
                 )
 
                 time.sleep(5)
+
                 continue
 
             updates = data.get(
@@ -274,11 +288,10 @@ def telegram_polling():
                     if text_message:
 
                         logging.info(
-                            "Telegram command received: %s",
+                            "Telegram command: %s",
                             text_message
                         )
 
-                        # Process command without killing polling.
                         threading.Thread(
                             target=process_telegram_command,
                             args=(text_message,),
@@ -304,7 +317,7 @@ def telegram_polling():
         except Exception as e:
 
             logging.exception(
-                "Telegram polling unexpected error: %s",
+                "Telegram polling error: %s",
                 e
             )
 
@@ -363,7 +376,9 @@ def get_candles(interval, outputsize=100):
 
         candles = []
 
-        for item in reversed(data["values"]):
+        for item in reversed(
+            data["values"]
+        ):
 
             try:
 
@@ -375,7 +390,11 @@ def get_candles(interval, outputsize=100):
                     "close": float(item["close"])
                 })
 
-            except (KeyError, ValueError, TypeError):
+            except (
+                KeyError,
+                ValueError,
+                TypeError
+            ):
 
                 continue
 
@@ -393,7 +412,7 @@ def get_candles(interval, outputsize=100):
     except Exception as e:
 
         logging.exception(
-            "Twelve Data unexpected error: %s",
+            "Twelve Data error: %s",
             e
         )
 
@@ -407,6 +426,7 @@ def get_candles(interval, outputsize=100):
 def calculate_atr(candles, period=14):
 
     if len(candles) < period + 1:
+
         return None
 
     true_ranges = []
@@ -431,17 +451,16 @@ def calculate_atr(candles, period=14):
             - previous["close"]
         )
 
-        true_range = max(
-            tr1,
-            tr2,
-            tr3
-        )
-
         true_ranges.append(
-            true_range
+            max(
+                tr1,
+                tr2,
+                tr3
+            )
         )
 
     if len(true_ranges) < period:
+
         return None
 
     recent = true_ranges[-period:]
@@ -453,10 +472,13 @@ def calculate_atr(candles, period=14):
 
 
 # ============================================================
-# CANDLE ANALYSIS
+# CANDLE FUNCTIONS
 # ============================================================
 
-def bullish_engulfing(previous, current):
+def bullish_engulfing(
+    previous,
+    current
+):
 
     return (
         previous["close"] < previous["open"]
@@ -466,7 +488,10 @@ def bullish_engulfing(previous, current):
     )
 
 
-def bearish_engulfing(previous, current):
+def bearish_engulfing(
+    previous,
+    current
+):
 
     return (
         previous["close"] > previous["open"]
@@ -500,6 +525,7 @@ def bullish_rejection(candle):
     )
 
     if body == 0:
+
         body = 0.00001
 
     return (
@@ -533,6 +559,7 @@ def bearish_rejection(candle):
     )
 
     if body == 0:
+
         body = 0.00001
 
     return (
@@ -549,6 +576,7 @@ def bearish_rejection(candle):
 def market_structure(candles):
 
     if len(candles) < 20:
+
         return "NEUTRAL"
 
     recent = candles[-20:]
@@ -574,9 +602,11 @@ def market_structure(candles):
     )
 
     if last_close > previous_high:
+
         return "BULLISH"
 
     if last_close < previous_low:
+
         return "BEARISH"
 
     return "NEUTRAL"
@@ -589,6 +619,7 @@ def market_structure(candles):
 def detect_liquidity_sweep(candles):
 
     if len(candles) < 10:
+
         return None
 
     current = candles[-1]
@@ -623,7 +654,7 @@ def detect_liquidity_sweep(candles):
 
 
 # ============================================================
-# SETUP ANALYZER
+# FULL MARKET ANALYSIS
 # ============================================================
 
 def analyze_market():
@@ -633,7 +664,7 @@ def analyze_market():
     ):
 
         logging.warning(
-            "Another market analysis is already running."
+            "Another analysis is already running."
         )
 
         return None
@@ -641,7 +672,7 @@ def analyze_market():
     try:
 
         logging.info(
-            "Starting market analysis..."
+            "Starting full market analysis..."
         )
 
         candles_m5 = get_candles(
@@ -659,13 +690,6 @@ def analyze_market():
             100
         )
 
-        logging.info(
-            "Data received | M5=%s M1=%s M15=%s",
-            len(candles_m5),
-            len(candles_m1),
-            len(candles_m15)
-        )
-
         if (
             len(candles_m5) < 30
             or len(candles_m1) < 10
@@ -678,12 +702,16 @@ def analyze_market():
 
             return None
 
-        m5_structure = market_structure(
-            candles_m5
-        )
+        # ====================================================
+        # STRUCTURE
+        # ====================================================
 
         m15_structure = market_structure(
             candles_m15
+        )
+
+        m5_structure = market_structure(
+            candles_m5
         )
 
         sweep = detect_liquidity_sweep(
@@ -700,13 +728,47 @@ def analyze_market():
 
         if atr is None or atr <= 0:
 
-            logging.warning(
-                "Invalid ATR."
-            )
-
             return None
 
         price = current_m1["close"]
+
+        # ====================================================
+        # M1 CANDLE
+        # ====================================================
+
+        m1_engulfing = "NONE"
+
+        if bullish_engulfing(
+            previous_m1,
+            current_m1
+        ):
+
+            m1_engulfing = "BULLISH ENGULFING"
+
+        elif bearish_engulfing(
+            previous_m1,
+            current_m1
+        ):
+
+            m1_engulfing = "BEARISH ENGULFING"
+
+        m1_rejection = "NONE"
+
+        if bullish_rejection(
+            current_m1
+        ):
+
+            m1_rejection = "BULLISH REJECTION"
+
+        elif bearish_rejection(
+            current_m1
+        ):
+
+            m1_rejection = "BEARISH REJECTION"
+
+        # ====================================================
+        # SCORES
+        # ====================================================
 
         buy_score = 0
         sell_score = 0
@@ -714,13 +776,12 @@ def analyze_market():
         reasons_buy = []
         reasons_sell = []
 
-        # ----------------------------------------------------
         # M15
-        # ----------------------------------------------------
 
         if m15_structure == "BULLISH":
 
             buy_score += 20
+
             reasons_buy.append(
                 "M15 bullish structure"
             )
@@ -728,17 +789,17 @@ def analyze_market():
         elif m15_structure == "BEARISH":
 
             sell_score += 20
+
             reasons_sell.append(
                 "M15 bearish structure"
             )
 
-        # ----------------------------------------------------
         # M5
-        # ----------------------------------------------------
 
         if m5_structure == "BULLISH":
 
             buy_score += 20
+
             reasons_buy.append(
                 "M5 bullish structure"
             )
@@ -746,17 +807,17 @@ def analyze_market():
         elif m5_structure == "BEARISH":
 
             sell_score += 20
+
             reasons_sell.append(
                 "M5 bearish structure"
             )
 
-        # ----------------------------------------------------
-        # LIQUIDITY SWEEP
-        # ----------------------------------------------------
+        # Sweep
 
         if sweep == "BULLISH":
 
             buy_score += 20
+
             reasons_buy.append(
                 "Bullish liquidity sweep"
             )
@@ -764,64 +825,55 @@ def analyze_market():
         elif sweep == "BEARISH":
 
             sell_score += 20
+
             reasons_sell.append(
                 "Bearish liquidity sweep"
             )
 
-        # ----------------------------------------------------
-        # M1 ENGULFING
-        # ----------------------------------------------------
+        # Engulfing
 
-        if bullish_engulfing(
-            previous_m1,
-            current_m1
-        ):
+        if m1_engulfing == "BULLISH ENGULFING":
 
             buy_score += 20
+
             reasons_buy.append(
                 "M1 bullish engulfing"
             )
 
-        if bearish_engulfing(
-            previous_m1,
-            current_m1
-        ):
+        elif m1_engulfing == "BEARISH ENGULFING":
 
             sell_score += 20
+
             reasons_sell.append(
                 "M1 bearish engulfing"
             )
 
-        # ----------------------------------------------------
-        # M1 REJECTION
-        # ----------------------------------------------------
+        # Rejection
 
-        if bullish_rejection(
-            current_m1
-        ):
+        if m1_rejection == "BULLISH REJECTION":
 
             buy_score += 15
+
             reasons_buy.append(
                 "M1 bullish rejection"
             )
 
-        if bearish_rejection(
-            current_m1
-        ):
+        elif m1_rejection == "BEARISH REJECTION":
 
             sell_score += 15
+
             reasons_sell.append(
                 "M1 bearish rejection"
             )
 
-        # ----------------------------------------------------
-        # DISPLACEMENT
-        # ----------------------------------------------------
+        # Displacement
 
         candle_range = (
             current_m1["high"]
             - current_m1["low"]
         )
+
+        displacement = "NONE"
 
         if candle_range > atr * 0.20:
 
@@ -831,6 +883,10 @@ def analyze_market():
             ):
 
                 buy_score += 10
+
+                displacement = (
+                    "BULLISH DISPLACEMENT"
+                )
 
                 reasons_buy.append(
                     "Bullish displacement"
@@ -843,13 +899,55 @@ def analyze_market():
 
                 sell_score += 10
 
+                displacement = (
+                    "BEARISH DISPLACEMENT"
+                )
+
                 reasons_sell.append(
                     "Bearish displacement"
                 )
 
-        # ----------------------------------------------------
-        # DIRECTION
-        # ----------------------------------------------------
+        # ====================================================
+        # OVERALL DIRECTION
+        # ====================================================
+
+        if (
+            m15_structure == "BULLISH"
+            and m5_structure == "BULLISH"
+        ):
+
+            overall = "STRONG BULLISH"
+
+        elif (
+            m15_structure == "BEARISH"
+            and m5_structure == "BEARISH"
+        ):
+
+            overall = "STRONG BEARISH"
+
+        elif (
+            m15_structure == "BULLISH"
+            or m5_structure == "BULLISH"
+        ):
+
+            overall = "BULLISH / MIXED"
+
+        elif (
+            m15_structure == "BEARISH"
+            or m5_structure == "BEARISH"
+        ):
+
+            overall = "BEARISH / MIXED"
+
+        else:
+
+            overall = "NEUTRAL / RANGE"
+
+        # ====================================================
+        # SELECT SIGNAL
+        # ====================================================
+
+        setup = None
 
         if (
             buy_score >= MIN_SCORE
@@ -860,6 +958,35 @@ def analyze_market():
             score = buy_score
             reasons = reasons_buy
 
+            entry = price
+
+            sl = (
+                entry
+                - atr * 0.80
+            )
+
+            tp1 = (
+                entry
+                + atr * 0.80
+            )
+
+            tp2 = (
+                entry
+                + atr * 1.50
+            )
+
+            setup = {
+                "direction": direction,
+                "score": score,
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "atr": atr,
+                "reasons": reasons,
+                "candle_time": current_m1["time"]
+            }
+
         elif (
             sell_score >= MIN_SCORE
             and sell_score > buy_score
@@ -869,60 +996,49 @@ def analyze_market():
             score = sell_score
             reasons = reasons_sell
 
-        else:
+            entry = price
 
-            logging.info(
-                "No setup | BUY=%s SELL=%s",
-                buy_score,
-                sell_score
+            sl = (
+                entry
+                + atr * 0.80
             )
 
-            return None
-
-        # ----------------------------------------------------
-        # ENTRY / SL / TP
-        # ----------------------------------------------------
-
-        entry = price
-
-        if direction == "BUY":
-
-            sl = entry - (
-                atr * 0.80
+            tp1 = (
+                entry
+                - atr * 0.80
             )
 
-            tp1 = entry + (
-                atr * 0.80
+            tp2 = (
+                entry
+                - atr * 1.50
             )
 
-            tp2 = entry + (
-                atr * 1.50
-            )
-
-        else:
-
-            sl = entry + (
-                atr * 0.80
-            )
-
-            tp1 = entry - (
-                atr * 0.80
-            )
-
-            tp2 = entry - (
-                atr * 1.50
-            )
+            setup = {
+                "direction": direction,
+                "score": score,
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "atr": atr,
+                "reasons": reasons,
+                "candle_time": current_m1["time"]
+            }
 
         return {
-            "direction": direction,
-            "score": score,
-            "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
+            "price": price,
             "atr": atr,
-            "reasons": reasons,
-            "candle_time": current_m1["time"]
+            "m15": m15_structure,
+            "m5": m5_structure,
+            "overall": overall,
+            "sweep": sweep or "NONE",
+            "m1_engulfing": m1_engulfing,
+            "m1_rejection": m1_rejection,
+            "displacement": displacement,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "candle_time": current_m1["time"],
+            "setup": setup
         }
 
     finally:
@@ -931,37 +1047,153 @@ def analyze_market():
 
 
 # ============================================================
-# SIGNAL MESSAGE
+# FULL ANALYSIS MESSAGE
 # ============================================================
 
-def format_signal(setup):
+def format_analysis_report(result):
 
-    direction = setup["direction"]
+    overall = result["overall"]
 
-    emoji = (
-        "🟢"
-        if direction == "BUY"
-        else "🔴"
+    if (
+        "BULLISH" in overall
+        and "BEARISH" not in overall
+    ):
+
+        overall_emoji = "🟢"
+
+    elif "BEARISH" in overall:
+
+        overall_emoji = "🔴"
+
+    else:
+
+        overall_emoji = "⚪"
+
+    setup = result["setup"]
+
+    message = (
+        "🔎 XAUUSD CANDLE EXPERT\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"💰 PRICE: {result['price']:.2f}\n"
+        f"📊 OVERALL: "
+        f"{overall_emoji} {overall}\n\n"
+
+        "🏦 MARKET STRUCTURE\n"
+        f"• M15: {result['m15']}\n"
+        f"• M5:  {result['m5']}\n"
+        f"• Liquidity Sweep: {result['sweep']}\n\n"
+
+        "🕯 M1 CANDLE\n"
+        f"• Engulfing: {result['m1_engulfing']}\n"
+        f"• Rejection: {result['m1_rejection']}\n"
+        f"• Displacement: {result['displacement']}\n\n"
+
+        "📈 SCORE\n"
+        f"• BUY:  {result['buy_score']}/80+\n"
+        f"• SELL: {result['sell_score']}/80+\n"
+        f"• Required: {MIN_SCORE}\n\n"
+
+        f"📏 M5 ATR: {result['atr']:.2f}\n"
+        f"🕐 Candle: {result['candle_time']}\n\n"
     )
 
-    reasons = "\n".join(
-        f"• {reason}"
-        for reason in setup["reasons"]
-    )
+    # ========================================================
+    # SIGNAL
+    # ========================================================
 
-    return (
-        "🚨 XAUUSD SCALP SIGNAL\n\n"
-        f"{emoji} {direction}\n\n"
-        f"ENTRY: {setup['entry']:.2f}\n"
-        f"SL: {setup['sl']:.2f}\n"
-        f"TP1: {setup['tp1']:.2f}\n"
-        f"TP2: {setup['tp2']:.2f}\n\n"
-        f"SCORE: {setup['score']}/100+\n"
-        f"LOT: {LOT_SIZE}\n\n"
-        f"WHY:\n{reasons}\n\n"
-        "⚠️ Manual execution only.\n"
-        "Wait for price confirmation."
-    )
+    if setup:
+
+        direction = setup["direction"]
+
+        emoji = (
+            "🟢"
+            if direction == "BUY"
+            else "🔴"
+        )
+
+        reasons = "\n".join(
+            f"• {reason}"
+            for reason in setup["reasons"]
+        )
+
+        message += (
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🚨 SIGNAL: {emoji} {direction}\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+
+            f"ENTRY: {setup['entry']:.2f}\n"
+            f"SL:    {setup['sl']:.2f}\n"
+            f"TP1:   {setup['tp1']:.2f}\n"
+            f"TP2:   {setup['tp2']:.2f}\n\n"
+
+            f"SCORE: {setup['score']}\n"
+            f"LOT: {LOT_SIZE}\n\n"
+
+            "WHY THIS SIGNAL:\n"
+            f"{reasons}\n\n"
+
+            "⚠️ Manual execution only.\n"
+            "Wait for price confirmation."
+        )
+
+    else:
+
+        # ====================================================
+        # NO TRADE EXPLANATION
+        # ====================================================
+
+        highest_score = max(
+            result["buy_score"],
+            result["sell_score"]
+        )
+
+        missing = max(
+            0,
+            MIN_SCORE - highest_score
+        )
+
+        if (
+            result["buy_score"]
+            > result["sell_score"]
+        ):
+
+            candidate = "BUY"
+
+        elif (
+            result["sell_score"]
+            > result["buy_score"]
+        ):
+
+            candidate = "SELL"
+
+        else:
+
+            candidate = "NONE"
+
+        message += (
+            "━━━━━━━━━━━━━━━━━━\n"
+            "⏳ NO TRADE\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+
+            f"Current candidate: {candidate}\n"
+            f"Highest score: {highest_score}\n"
+            f"Points needed: {missing}\n\n"
+
+            "Reason:\n"
+            "The complete candle structure "
+            "has not reached the required "
+            f"{MIN_SCORE}-point confirmation.\n\n"
+
+            "🛑 NO ENTRY\n"
+            "🛑 NO SL\n"
+            "🛑 NO TP\n\n"
+
+            "The bot is waiting for stronger "
+            "M1/M5/M15 confirmation."
+        )
+
+    return message
 
 
 # ============================================================
@@ -999,47 +1231,55 @@ def scanner():
 
         try:
 
-            setup = analyze_market()
+            result = analyze_market()
 
-            if setup:
+            if result:
 
-                current_id = setup_id(
-                    setup
+                setup = result.get(
+                    "setup"
                 )
 
-                if (
-                    current_id
-                    != LAST_AUTO_SETUP_ID
-                ):
+                if setup:
 
-                    message = format_signal(
+                    current_id = setup_id(
                         setup
                     )
 
-                    if send_telegram(
-                        message
+                    if (
+                        current_id
+                        != LAST_AUTO_SETUP_ID
                     ):
 
-                        LAST_AUTO_SETUP_ID = (
-                            current_id
+                        message = (
+                            format_analysis_report(
+                                result
+                            )
                         )
 
+                        if send_telegram(
+                            message
+                        ):
+
+                            LAST_AUTO_SETUP_ID = (
+                                current_id
+                            )
+
+                            logging.info(
+                                "AUTO SIGNAL SENT: %s",
+                                setup["direction"]
+                            )
+
+                    else:
+
                         logging.info(
-                            "AUTO SIGNAL SENT: %s",
-                            setup["direction"]
+                            "Duplicate setup ignored."
                         )
 
                 else:
 
                     logging.info(
-                        "Duplicate setup ignored."
+                        "No high-quality setup."
                     )
-
-            else:
-
-                logging.info(
-                    "No high-quality setup."
-                )
 
         except Exception as e:
 
@@ -1048,7 +1288,10 @@ def scanner():
                 e
             )
 
-        elapsed = time.time() - cycle_start
+        elapsed = (
+            time.time()
+            - cycle_start
+        )
 
         remaining = max(
             1,
@@ -1061,7 +1304,6 @@ def scanner():
             remaining
         )
 
-        # Always return to the loop.
         while remaining > 0:
 
             sleep_time = min(
@@ -1080,7 +1322,10 @@ def scanner():
 # FLASK
 # ============================================================
 
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
 
     return jsonify({
@@ -1092,7 +1337,10 @@ def home():
     })
 
 
-@app.route("/health", methods=["GET"])
+@app.route(
+    "/health",
+    methods=["GET"]
+)
 def health():
 
     return jsonify({
@@ -1101,7 +1349,7 @@ def health():
 
 
 # ============================================================
-# MANUAL SIGNAL WEB ROUTE
+# WEB MANUAL SIGNAL
 # ============================================================
 
 @app.route(
@@ -1114,60 +1362,33 @@ def manual_signal():
 
     try:
 
-        setup = analyze_market()
+        result = analyze_market()
 
-        if not setup:
-
-            message = (
-                "⏳ NO HIGH-QUALITY SETUP\n\n"
-                "The candle structure does not "
-                "currently meet the 80-point "
-                "confirmation threshold.\n\n"
-                "No trade."
-            )
-
-            send_telegram(
-                message
-            )
+        if not result:
 
             return jsonify({
-                "status": "no_setup"
-            })
+                "status": "analysis_failed"
+            }), 500
 
-        current_id = setup_id(
-            setup
+        message = format_analysis_report(
+            result
         )
 
-        message = format_signal(
-            setup
-        )
+        if send_telegram(message):
 
-        if (
-            current_id
-            == LAST_MANUAL_SETUP_ID
-        ):
-
-            message = (
-                "ℹ️ SAME SETUP\n\n"
-                + message
+            setup = result.get(
+                "setup"
             )
 
-        if send_telegram(
-            message
-        ):
+            if setup:
 
-            LAST_MANUAL_SETUP_ID = (
-                current_id
-            )
+                LAST_MANUAL_SETUP_ID = (
+                    setup_id(setup)
+                )
 
             return jsonify({
-                "status": "signal_sent",
-                "direction": setup[
-                    "direction"
-                ],
-                "score": setup[
-                    "score"
-                ]
+                "status": "analysis_sent",
+                "has_signal": bool(setup)
             })
 
         return jsonify({
@@ -1188,7 +1409,7 @@ def manual_signal():
 
 
 # ============================================================
-# OLD WEBHOOK ROUTE
+# TELEGRAM WEBHOOK COMPATIBILITY
 # ============================================================
 
 @app.route(

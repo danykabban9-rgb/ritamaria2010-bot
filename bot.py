@@ -4,13 +4,14 @@ import threading
 import logging
 import hashlib
 import requests
-
+from datetime import datetime
 from flask import Flask, request, jsonify
 
 
 # ============================================================
-# RITAMARIAGOLD - XAUUSD CANDLE EXPERT
-# STABLE RENDER VERSION
+# RITAMARIAGOLD
+# XAUUSD CANDLE STRUCTURE EXPERT
+# STABLE / DIAGNOSTIC VERSION
 # ============================================================
 
 SYMBOL = "XAU/USD"
@@ -59,8 +60,6 @@ LAST_MANUAL_SETUP_ID = None
 
 TELEGRAM_OFFSET = 0
 
-SCAN_LOCK = threading.Lock()
-
 SHUTDOWN_EVENT = threading.Event()
 
 scanner_thread = None
@@ -73,9 +72,36 @@ telegram_restart_count = 0
 last_scanner_heartbeat = 0
 last_telegram_heartbeat = 0
 
+last_scan_time = 0
+last_scan_result = "NOT STARTED"
+
+last_telegram_success = 0
+last_telegram_error = ""
+
+last_data_success = 0
+last_data_error = ""
+
 services_started = False
 
-thread_manager_lock = threading.Lock()
+# IMPORTANT:
+# RLock prevents the startup deadlock in the previous version.
+thread_manager_lock = threading.RLock()
+
+SCAN_LOCK = threading.Lock()
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def now_string():
+
+    try:
+        return datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except Exception:
+        return "unknown"
 
 
 # ============================================================
@@ -84,7 +110,14 @@ thread_manager_lock = threading.Lock()
 
 def send_telegram(message):
 
+    global last_telegram_success
+    global last_telegram_error
+
     if not TELEGRAM_TOKEN:
+
+        last_telegram_error = (
+            "TELEGRAM_TOKEN missing"
+        )
 
         logging.error(
             "TELEGRAM_TOKEN is missing."
@@ -94,6 +127,10 @@ def send_telegram(message):
 
     if not TELEGRAM_CHAT_ID:
 
+        last_telegram_error = (
+            "TELEGRAM_CHAT_ID missing"
+        )
+
         logging.error(
             "TELEGRAM_CHAT_ID is missing."
         )
@@ -101,6 +138,10 @@ def send_telegram(message):
         return False
 
     if not message:
+
+        last_telegram_error = (
+            "Empty Telegram message"
+        )
 
         logging.error(
             "Telegram message is empty."
@@ -125,14 +166,14 @@ def send_telegram(message):
 
         if response.status_code != 200:
 
-            logging.error(
-                "Telegram HTTP error: %s",
-                response.status_code
+            last_telegram_error = (
+                f"HTTP {response.status_code}: "
+                f"{response.text[:300]}"
             )
 
             logging.error(
-                "Telegram response: %s",
-                response.text
+                "Telegram HTTP error: %s",
+                response.status_code
             )
 
             return False
@@ -141,6 +182,8 @@ def send_telegram(message):
 
         if not data.get("ok"):
 
+            last_telegram_error = str(data)
+
             logging.error(
                 "Telegram API rejected message: %s",
                 data
@@ -148,9 +191,14 @@ def send_telegram(message):
 
             return False
 
+        last_telegram_success = time.time()
+        last_telegram_error = ""
+
         return True
 
     except requests.RequestException as e:
+
+        last_telegram_error = str(e)
 
         logging.error(
             "Telegram connection error: %s",
@@ -161,12 +209,54 @@ def send_telegram(message):
 
     except Exception as e:
 
+        last_telegram_error = str(e)
+
         logging.exception(
-            "Telegram send unexpected error: %s",
-            e
+            "Telegram send unexpected error."
         )
 
         return False
+
+
+# ============================================================
+# TELEGRAM API TEST
+# ============================================================
+
+def telegram_api_test():
+
+    if not TELEGRAM_TOKEN:
+
+        return False, "TELEGRAM_TOKEN missing"
+
+    try:
+
+        response = requests.get(
+            f"{TELEGRAM_API}/getMe",
+            timeout=10
+        )
+
+        if response.status_code != 200:
+
+            return False, (
+                f"HTTP {response.status_code}"
+            )
+
+        data = response.json()
+
+        if not data.get("ok"):
+
+            return False, str(data)
+
+        username = (
+            data.get("result", {})
+            .get("username", "unknown")
+        )
+
+        return True, username
+
+    except Exception as e:
+
+        return False, str(e)
 
 
 # ============================================================
@@ -177,99 +267,72 @@ def process_telegram_command(text_message):
 
     global LAST_MANUAL_SETUP_ID
 
-    if not text_message:
-        return
-
     try:
 
-        command = text_message.strip().split()[0].lower()
+        if not text_message:
 
-        # ----------------------------------------------------
+            return
+
+        parts = text_message.strip().split()
+
+        if not parts:
+
+            return
+
+        command = parts[0].lower()
+
+        # ====================================================
         # START
-        # ----------------------------------------------------
+        # ====================================================
 
         if command == "/start":
 
             send_telegram(
-                "🟢 RITAMARIAGOLD ONLINE\n\n"
+
+                "🟢 RITAMARIAGOLD ONLINE\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+
                 "XAUUSD Candle Structure Expert\n\n"
+
                 "Commands:\n"
                 "/signal - Full gold analysis\n"
-                "/status - Bot status"
+                "/status - Service status\n"
+                "/debug - Full diagnostics\n\n"
+
+                f"Scanner: every {SCAN_SECONDS}s\n"
+                f"Minimum score: {MIN_SCORE}\n"
+                f"Lot: {LOT_SIZE}"
             )
 
             return
 
-        # ----------------------------------------------------
+        # ====================================================
         # STATUS
-        # ----------------------------------------------------
+        # ====================================================
 
         if command == "/status":
 
-            scanner_alive = (
-                scanner_thread is not None
-                and scanner_thread.is_alive()
-            )
-
-            telegram_alive = (
-                telegram_thread is not None
-                and telegram_thread.is_alive()
-            )
-
-            supervisor_alive = (
-                supervisor_thread is not None
-                and supervisor_thread.is_alive()
-            )
-
-            scanner_age = (
-                int(time.time() - last_scanner_heartbeat)
-                if last_scanner_heartbeat
-                else -1
-            )
-
-            telegram_age = (
-                int(time.time() - last_telegram_heartbeat)
-                if last_telegram_heartbeat
-                else -1
-            )
-
             send_telegram(
-
-                "🟢 RITAMARIAGOLD STATUS\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-
-                f"Scanner: "
-                f"{'🟢 ALIVE' if scanner_alive else '🔴 DEAD'}\n"
-
-                f"Telegram: "
-                f"{'🟢 ALIVE' if telegram_alive else '🔴 DEAD'}\n"
-
-                f"Supervisor: "
-                f"{'🟢 ALIVE' if supervisor_alive else '🔴 DEAD'}\n\n"
-
-                f"Scanner heartbeat: "
-                f"{scanner_age}s ago\n"
-
-                f"Telegram heartbeat: "
-                f"{telegram_age}s ago\n\n"
-
-                f"Symbol: {SYMBOL}\n"
-                f"Scan: every {SCAN_SECONDS}s\n"
-                f"Minimum score: {MIN_SCORE}\n"
-                f"Lot: {LOT_SIZE}\n\n"
-
-                f"Scanner restarts: "
-                f"{scanner_restart_count}\n"
-
-                f"Telegram restarts: "
-                f"{telegram_restart_count}"
+                build_status_message()
             )
 
             return
 
-        # ----------------------------------------------------
+        # ====================================================
+        # DEBUG
+        # ====================================================
+
+        if command == "/debug":
+
+            send_telegram(
+                build_debug_message()
+            )
+
+            return
+
+        # ====================================================
         # SIGNAL
-        # ----------------------------------------------------
+        # ====================================================
 
         if command == "/signal":
 
@@ -282,8 +345,14 @@ def process_telegram_command(text_message):
             if not result:
 
                 send_telegram(
-                    "⚠️ ANALYSIS FAILED\n\n"
-                    "Market data could not be analyzed."
+
+                    "⚠️ ANALYSIS FAILED\n"
+                    "━━━━━━━━━━━━━━━━━━\n\n"
+
+                    "Market data could not be analyzed.\n\n"
+
+                    f"Data error:\n"
+                    f"{last_data_error or 'Unknown'}"
                 )
 
                 return
@@ -298,23 +367,223 @@ def process_telegram_command(text_message):
 
             if setup:
 
-                LAST_MANUAL_SETUP_ID = setup_id(
-                    setup
-                )
-
-                logging.info(
-                    "Manual signal sent: %s",
-                    setup["direction"]
+                LAST_MANUAL_SETUP_ID = (
+                    setup_id(setup)
                 )
 
             return
 
+        # ====================================================
+        # UNKNOWN
+        # ====================================================
+
+        send_telegram(
+
+            "❓ Unknown command.\n\n"
+
+            "Available:\n"
+            "/start\n"
+            "/signal\n"
+            "/status\n"
+            "/debug"
+        )
+
     except Exception as e:
 
         logging.exception(
-            "Command processing error: %s",
-            e
+            "Command processing error."
         )
+
+        try:
+
+            send_telegram(
+                f"⚠️ Command error:\n{str(e)[:500]}"
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# STATUS MESSAGE
+# ============================================================
+
+def build_status_message():
+
+    scanner_alive = (
+        scanner_thread is not None
+        and scanner_thread.is_alive()
+    )
+
+    telegram_alive = (
+        telegram_thread is not None
+        and telegram_thread.is_alive()
+    )
+
+    supervisor_alive = (
+        supervisor_thread is not None
+        and supervisor_thread.is_alive()
+    )
+
+    scanner_age = (
+        int(time.time() - last_scanner_heartbeat)
+        if last_scanner_heartbeat
+        else -1
+    )
+
+    telegram_age = (
+        int(time.time() - last_telegram_heartbeat)
+        if last_telegram_heartbeat
+        else -1
+    )
+
+    return (
+
+        "🟢 RITAMARIAGOLD STATUS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"Scanner: "
+        f"{'🟢 ALIVE' if scanner_alive else '🔴 DEAD'}\n"
+
+        f"Telegram: "
+        f"{'🟢 ALIVE' if telegram_alive else '🔴 DEAD'}\n"
+
+        f"Supervisor: "
+        f"{'🟢 ALIVE' if supervisor_alive else '🔴 DEAD'}\n\n"
+
+        f"Scanner heartbeat: "
+        f"{scanner_age}s ago\n"
+
+        f"Telegram heartbeat: "
+        f"{telegram_age}s ago\n\n"
+
+        f"Scanner restarts: "
+        f"{scanner_restart_count}\n"
+
+        f"Telegram restarts: "
+        f"{telegram_restart_count}\n\n"
+
+        f"Last scan: "
+        f"{last_scan_result}\n\n"
+
+        f"Symbol: {SYMBOL}\n"
+        f"Scan: {SCAN_SECONDS}s\n"
+        f"Minimum score: {MIN_SCORE}\n"
+        f"Lot: {LOT_SIZE}"
+    )
+
+
+# ============================================================
+# DEBUG MESSAGE
+# ============================================================
+
+def build_debug_message():
+
+    scanner_alive = (
+        scanner_thread is not None
+        and scanner_thread.is_alive()
+    )
+
+    telegram_alive = (
+        telegram_thread is not None
+        and telegram_thread.is_alive()
+    )
+
+    supervisor_alive = (
+        supervisor_thread is not None
+        and supervisor_thread.is_alive()
+    )
+
+    # Telegram API
+
+    telegram_ok, telegram_info = (
+        telegram_api_test()
+    )
+
+    # Time since events
+
+    if last_scanner_heartbeat:
+
+        scanner_age = int(
+            time.time()
+            - last_scanner_heartbeat
+        )
+
+    else:
+
+        scanner_age = -1
+
+    if last_telegram_heartbeat:
+
+        telegram_age = int(
+            time.time()
+            - last_telegram_heartbeat
+        )
+
+    else:
+
+        telegram_age = -1
+
+    if last_data_success:
+
+        data_age = int(
+            time.time()
+            - last_data_success
+        )
+
+    else:
+
+        data_age = -1
+
+    return (
+
+        "🛠 RITAMARIAGOLD DEBUG\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"Process: 🟢 ALIVE\n"
+
+        f"Telegram thread: "
+        f"{'🟢 ALIVE' if telegram_alive else '🔴 DEAD'}\n"
+
+        f"Scanner thread: "
+        f"{'🟢 ALIVE' if scanner_alive else '🔴 DEAD'}\n"
+
+        f"Supervisor: "
+        f"{'🟢 ALIVE' if supervisor_alive else '🔴 DEAD'}\n\n"
+
+        f"Telegram API: "
+        f"{'🟢 OK' if telegram_ok else '🔴 ERROR'}\n"
+
+        f"Telegram bot: "
+        f"{telegram_info}\n\n"
+
+        f"Scanner heartbeat: "
+        f"{scanner_age}s ago\n"
+
+        f"Telegram heartbeat: "
+        f"{telegram_age}s ago\n"
+
+        f"Data success: "
+        f"{data_age}s ago\n\n"
+
+        f"Last scan:\n"
+        f"{last_scan_result}\n\n"
+
+        f"Last Telegram error:\n"
+        f"{last_telegram_error or 'NONE'}\n\n"
+
+        f"Last data error:\n"
+        f"{last_data_error or 'NONE'}\n\n"
+
+        f"Scanner restarts: "
+        f"{scanner_restart_count}\n"
+
+        f"Telegram restarts: "
+        f"{telegram_restart_count}\n\n"
+
+        f"Server time:\n"
+        f"{now_string()}"
+    )
 
 
 # ============================================================
@@ -325,14 +594,7 @@ def telegram_polling():
 
     global TELEGRAM_OFFSET
     global last_telegram_heartbeat
-
-    if not TELEGRAM_TOKEN:
-
-        logging.error(
-            "TELEGRAM_TOKEN missing."
-        )
-
-        return
+    global last_telegram_error
 
     logging.info(
         "=================================================="
@@ -345,6 +607,34 @@ def telegram_polling():
     logging.info(
         "=================================================="
     )
+
+    if not TELEGRAM_TOKEN:
+
+        logging.error(
+            "TELEGRAM_TOKEN missing."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Check Telegram
+    # --------------------------------------------------------
+
+    ok, info = telegram_api_test()
+
+    if ok:
+
+        logging.info(
+            "Telegram API OK | Bot: %s",
+            info
+        )
+
+    else:
+
+        logging.error(
+            "Telegram API test failed: %s",
+            info
+        )
 
     # --------------------------------------------------------
     # Remove webhook
@@ -361,26 +651,28 @@ def telegram_polling():
         )
 
         logging.info(
-            "Telegram deleteWebhook response: %s",
-            response.text
+            "deleteWebhook: %s",
+            response.text[:500]
         )
 
     except Exception as e:
 
         logging.error(
-            "Could not remove Telegram webhook: %s",
+            "deleteWebhook failed: %s",
             e
         )
 
     # --------------------------------------------------------
-    # Poll forever
+    # Poll
     # --------------------------------------------------------
 
     while not SHUTDOWN_EVENT.is_set():
 
         try:
 
-            last_telegram_heartbeat = time.time()
+            last_telegram_heartbeat = (
+                time.time()
+            )
 
             response = requests.get(
 
@@ -388,16 +680,23 @@ def telegram_polling():
 
                 params={
                     "offset": TELEGRAM_OFFSET,
-                    "timeout": 25,
+                    "timeout": 20,
                     "allowed_updates": '["message"]'
                 },
 
-                timeout=35
+                timeout=30
             )
 
-            last_telegram_heartbeat = time.time()
+            last_telegram_heartbeat = (
+                time.time()
+            )
 
             if response.status_code != 200:
+
+                last_telegram_error = (
+                    f"getUpdates HTTP "
+                    f"{response.status_code}"
+                )
 
                 logging.error(
                     "Telegram getUpdates HTTP error: %s",
@@ -412,14 +711,18 @@ def telegram_polling():
 
             if not data.get("ok"):
 
+                last_telegram_error = str(data)
+
                 logging.error(
-                    "Telegram getUpdates API error: %s",
+                    "Telegram getUpdates error: %s",
                     data
                 )
 
                 time.sleep(5)
 
                 continue
+
+            last_telegram_error = ""
 
             updates = data.get(
                 "result",
@@ -469,14 +772,15 @@ def telegram_polling():
 
                         ).start()
 
-                except Exception as e:
+                except Exception:
 
                     logging.exception(
-                        "Telegram update processing error: %s",
-                        e
+                        "Telegram update processing error."
                     )
 
         except requests.RequestException as e:
+
+            last_telegram_error = str(e)
 
             logging.error(
                 "Telegram polling connection error: %s",
@@ -487,9 +791,10 @@ def telegram_polling():
 
         except Exception as e:
 
+            last_telegram_error = str(e)
+
             logging.exception(
-                "Telegram polling unexpected error: %s",
-                e
+                "Telegram polling unexpected error."
             )
 
             time.sleep(5)
@@ -505,10 +810,17 @@ def telegram_polling():
 
 def get_candles(interval, outputsize=100):
 
+    global last_data_success
+    global last_data_error
+
     if not TWELVE_DATA_KEY:
 
+        last_data_error = (
+            "TWELVE_DATA_KEY missing"
+        )
+
         logging.error(
-            "TWELVE_DATA_KEY is missing."
+            "TWELVE_DATA_KEY missing."
         )
 
         return []
@@ -539,6 +851,10 @@ def get_candles(interval, outputsize=100):
 
         if response.status_code != 200:
 
+            last_data_error = (
+                f"HTTP {response.status_code}"
+            )
+
             logging.error(
                 "Twelve Data HTTP error: %s",
                 response.status_code
@@ -549,6 +865,8 @@ def get_candles(interval, outputsize=100):
         data = response.json()
 
         if "values" not in data:
+
+            last_data_error = str(data)
 
             logging.error(
                 "Twelve Data response: %s",
@@ -567,23 +885,20 @@ def get_candles(interval, outputsize=100):
 
                 candles.append({
 
-                    "time": item["datetime"],
+                    "time":
+                        item["datetime"],
 
-                    "open": float(
-                        item["open"]
-                    ),
+                    "open":
+                        float(item["open"]),
 
-                    "high": float(
-                        item["high"]
-                    ),
+                    "high":
+                        float(item["high"]),
 
-                    "low": float(
-                        item["low"]
-                    ),
+                    "low":
+                        float(item["low"]),
 
-                    "close": float(
-                        item["close"]
-                    )
+                    "close":
+                        float(item["close"])
                 })
 
             except (
@@ -594,9 +909,16 @@ def get_candles(interval, outputsize=100):
 
                 continue
 
+        if candles:
+
+            last_data_success = time.time()
+            last_data_error = ""
+
         return candles
 
     except requests.RequestException as e:
+
+        last_data_error = str(e)
 
         logging.error(
             "Twelve Data connection error: %s",
@@ -607,9 +929,10 @@ def get_candles(interval, outputsize=100):
 
     except Exception as e:
 
+        last_data_error = str(e)
+
         logging.exception(
-            "Twelve Data unexpected error: %s",
-            e
+            "Twelve Data unexpected error."
         )
 
         return []
@@ -636,7 +959,6 @@ def calculate_atr(
     ):
 
         current = candles[i]
-
         previous = candles[i - 1]
 
         tr1 = (
@@ -666,11 +988,9 @@ def calculate_atr(
 
         return None
 
-    recent = true_ranges[-period:]
-
     return (
-        sum(recent)
-        / len(recent)
+        sum(true_ranges[-period:])
+        / period
     )
 
 
@@ -678,10 +998,7 @@ def calculate_atr(
 # CANDLE FUNCTIONS
 # ============================================================
 
-def bullish_engulfing(
-    previous,
-    current
-):
+def bullish_engulfing(previous, current):
 
     return (
 
@@ -705,10 +1022,7 @@ def bullish_engulfing(
     )
 
 
-def bearish_engulfing(
-    previous,
-    current
-):
+def bearish_engulfing(previous, current):
 
     return (
 
@@ -732,9 +1046,7 @@ def bearish_engulfing(
     )
 
 
-def bullish_rejection(
-    candle
-):
+def bullish_rejection(candle):
 
     body = abs(
         candle["close"]
@@ -742,19 +1054,15 @@ def bullish_rejection(
     )
 
     lower_wick = (
-
         min(
             candle["open"],
             candle["close"]
         )
-
         - candle["low"]
     )
 
     upper_wick = (
-
         candle["high"]
-
         - max(
             candle["open"],
             candle["close"]
@@ -780,9 +1088,7 @@ def bullish_rejection(
     )
 
 
-def bearish_rejection(
-    candle
-):
+def bearish_rejection(candle):
 
     body = abs(
         candle["close"]
@@ -790,9 +1096,7 @@ def bearish_rejection(
     )
 
     upper_wick = (
-
         candle["high"]
-
         - max(
             candle["open"],
             candle["close"]
@@ -800,12 +1104,10 @@ def bearish_rejection(
     )
 
     lower_wick = (
-
         min(
             candle["open"],
             candle["close"]
         )
-
         - candle["low"]
     )
 
@@ -832,9 +1134,7 @@ def bearish_rejection(
 # MARKET STRUCTURE
 # ============================================================
 
-def market_structure(
-    candles
-):
+def market_structure(candles):
 
     if len(candles) < 20:
 
@@ -843,17 +1143,13 @@ def market_structure(
     recent = candles[-20:]
 
     highs = [
-
-        candle["high"]
-
-        for candle in recent
+        c["high"]
+        for c in recent
     ]
 
     lows = [
-
-        candle["low"]
-
-        for candle in recent
+        c["low"]
+        for c in recent
     ]
 
     last_close = recent[-1]["close"]
@@ -881,9 +1177,7 @@ def market_structure(
 # LIQUIDITY SWEEP
 # ============================================================
 
-def detect_liquidity_sweep(
-    candles
-):
+def detect_liquidity_sweep(candles):
 
     if len(candles) < 10:
 
@@ -894,23 +1188,16 @@ def detect_liquidity_sweep(
     recent = candles[-10:-2]
 
     previous_high = max(
-
-        candle["high"]
-
-        for candle in recent
+        c["high"]
+        for c in recent
     )
 
     previous_low = min(
-
-        candle["low"]
-
-        for candle in recent
+        c["low"]
+        for c in recent
     )
 
-    # Bearish sweep
-
     if (
-
         current["high"]
         > previous_high
 
@@ -922,10 +1209,7 @@ def detect_liquidity_sweep(
 
         return "BEARISH"
 
-    # Bullish sweep
-
     if (
-
         current["low"]
         < previous_low
 
@@ -941,7 +1225,7 @@ def detect_liquidity_sweep(
 
 
 # ============================================================
-# FULL MARKET ANALYSIS
+# MARKET ANALYSIS
 # ============================================================
 
 def analyze_market():
@@ -951,7 +1235,7 @@ def analyze_market():
     ):
 
         logging.warning(
-            "Another analysis is already running."
+            "Another analysis is running."
         )
 
         return None
@@ -961,10 +1245,6 @@ def analyze_market():
         logging.info(
             "Starting full XAUUSD analysis..."
         )
-
-        # ----------------------------------------------------
-        # DATA
-        # ----------------------------------------------------
 
         candles_m5 = get_candles(
             "5min",
@@ -993,10 +1273,6 @@ def analyze_market():
 
             return None
 
-        # ----------------------------------------------------
-        # STRUCTURE
-        # ----------------------------------------------------
-
         m15_structure = market_structure(
             candles_m15
         )
@@ -1009,17 +1285,8 @@ def analyze_market():
             candles_m5
         )
 
-        # ----------------------------------------------------
-        # M1
-        # ----------------------------------------------------
-
         previous_m1 = candles_m1[-2]
-
         current_m1 = candles_m1[-1]
-
-        # ----------------------------------------------------
-        # ATR
-        # ----------------------------------------------------
 
         atr = calculate_atr(
             candles_m5,
@@ -1037,7 +1304,7 @@ def analyze_market():
         price = current_m1["close"]
 
         # ----------------------------------------------------
-        # M1 ENGULFING
+        # ENGULFING
         # ----------------------------------------------------
 
         m1_engulfing = "NONE"
@@ -1061,7 +1328,7 @@ def analyze_market():
             )
 
         # ----------------------------------------------------
-        # M1 REJECTION
+        # REJECTION
         # ----------------------------------------------------
 
         m1_rejection = "NONE"
@@ -1087,16 +1354,10 @@ def analyze_market():
         # ----------------------------------------------------
 
         buy_score = 0
-
         sell_score = 0
 
         reasons_buy = []
-
         reasons_sell = []
-
-        # ----------------------------------------------------
-        # M15
-        # ----------------------------------------------------
 
         if m15_structure == "BULLISH":
 
@@ -1114,10 +1375,6 @@ def analyze_market():
                 "M15 bearish structure"
             )
 
-        # ----------------------------------------------------
-        # M5
-        # ----------------------------------------------------
-
         if m5_structure == "BULLISH":
 
             buy_score += 20
@@ -1134,10 +1391,6 @@ def analyze_market():
                 "M5 bearish structure"
             )
 
-        # ----------------------------------------------------
-        # LIQUIDITY SWEEP
-        # ----------------------------------------------------
-
         if sweep == "BULLISH":
 
             buy_score += 20
@@ -1153,10 +1406,6 @@ def analyze_market():
             reasons_sell.append(
                 "Bearish liquidity sweep"
             )
-
-        # ----------------------------------------------------
-        # ENGULFING
-        # ----------------------------------------------------
 
         if (
             m1_engulfing
@@ -1179,10 +1428,6 @@ def analyze_market():
             reasons_sell.append(
                 "M1 bearish engulfing"
             )
-
-        # ----------------------------------------------------
-        # REJECTION
-        # ----------------------------------------------------
 
         if (
             m1_rejection
@@ -1211,9 +1456,7 @@ def analyze_market():
         # ----------------------------------------------------
 
         candle_range = (
-
             current_m1["high"]
-
             - current_m1["low"]
         )
 
@@ -1297,14 +1540,9 @@ def analyze_market():
 
         setup = None
 
-        # BUY
-
         if (
-
             buy_score >= MIN_SCORE
-
             and
-
             buy_score > sell_score
         ):
 
@@ -1347,14 +1585,9 @@ def analyze_market():
                     current_m1["time"]
             }
 
-        # SELL
-
         elif (
-
             sell_score >= MIN_SCORE
-
             and
-
             sell_score > buy_score
         ):
 
@@ -1436,8 +1669,7 @@ def analyze_market():
     except Exception as e:
 
         logging.exception(
-            "Market analysis error: %s",
-            e
+            "Market analysis error."
         )
 
         return None
@@ -1448,12 +1680,10 @@ def analyze_market():
 
 
 # ============================================================
-# FORMAT TELEGRAM REPORT
+# FORMAT REPORT
 # ============================================================
 
-def format_analysis_report(
-    result
-):
+def format_analysis_report(result):
 
     overall = result["overall"]
 
@@ -1478,7 +1708,6 @@ def format_analysis_report(
     message = (
 
         "🔎 XAUUSD CANDLE EXPERT\n"
-
         "━━━━━━━━━━━━━━━━━━\n\n"
 
         f"💰 PRICE: "
@@ -1489,12 +1718,8 @@ def format_analysis_report(
 
         "🏦 MARKET STRUCTURE\n"
 
-        f"• M15: "
-        f"{result['m15']}\n"
-
-        f"• M5:  "
-        f"{result['m5']}\n"
-
+        f"• M15: {result['m15']}\n"
+        f"• M5: {result['m5']}\n"
         f"• Liquidity Sweep: "
         f"{result['sweep']}\n\n"
 
@@ -1511,14 +1736,9 @@ def format_analysis_report(
 
         "📈 SCORE\n"
 
-        f"• BUY: "
-        f"{result['buy_score']}\n"
-
-        f"• SELL: "
-        f"{result['sell_score']}\n"
-
-        f"• Required: "
-        f"{MIN_SCORE}\n\n"
+        f"• BUY: {result['buy_score']}\n"
+        f"• SELL: {result['sell_score']}\n"
+        f"• Required: {MIN_SCORE}\n\n"
 
         f"📏 M5 ATR: "
         f"{result['atr']:.2f}\n"
@@ -1526,10 +1746,6 @@ def format_analysis_report(
         f"🕐 Candle: "
         f"{result['candle_time']}\n\n"
     )
-
-    # ========================================================
-    # SIGNAL
-    # ========================================================
 
     if setup:
 
@@ -1542,11 +1758,8 @@ def format_analysis_report(
         )
 
         reasons = "\n".join(
-
             f"• {reason}"
-
-            for reason
-            in setup["reasons"]
+            for reason in setup["reasons"]
         )
 
         message += (
@@ -1558,48 +1771,31 @@ def format_analysis_report(
 
             "━━━━━━━━━━━━━━━━━━\n\n"
 
-            f"ENTRY: "
-            f"{setup['entry']:.2f}\n"
+            f"ENTRY: {setup['entry']:.2f}\n"
+            f"SL:    {setup['sl']:.2f}\n"
+            f"TP1:   {setup['tp1']:.2f}\n"
+            f"TP2:   {setup['tp2']:.2f}\n\n"
 
-            f"SL:    "
-            f"{setup['sl']:.2f}\n"
-
-            f"TP1:   "
-            f"{setup['tp1']:.2f}\n"
-
-            f"TP2:   "
-            f"{setup['tp2']:.2f}\n\n"
-
-            f"SCORE: "
-            f"{setup['score']}\n"
-
-            f"LOT: "
-            f"{LOT_SIZE}\n\n"
+            f"SCORE: {setup['score']}\n"
+            f"LOT: {LOT_SIZE}\n\n"
 
             "WHY THIS SIGNAL:\n"
-
             f"{reasons}\n\n"
 
             "⚠️ Manual execution only.\n"
-
             "Wait for price confirmation."
         )
 
     else:
 
         highest_score = max(
-
             result["buy_score"],
-
             result["sell_score"]
         )
 
         missing = max(
-
             0,
-
-            MIN_SCORE
-            - highest_score
+            MIN_SCORE - highest_score
         )
 
         if (
@@ -1625,13 +1821,10 @@ def format_analysis_report(
         message += (
 
             "━━━━━━━━━━━━━━━━━━\n"
-
             "⏳ NO TRADE\n"
-
             "━━━━━━━━━━━━━━━━━━\n\n"
 
-            f"Current candidate: "
-            f"{candidate}\n"
+            f"Current candidate: {candidate}\n"
 
             f"Highest score: "
             f"{highest_score}\n"
@@ -1639,17 +1832,15 @@ def format_analysis_report(
             f"Points needed: "
             f"{missing}\n\n"
 
-            "Reason:\n"
-
-            "The complete candle structure "
-            "has not reached the required "
-            f"{MIN_SCORE}-point confirmation.\n\n"
+            "The candle structure has not "
+            f"reached the {MIN_SCORE}-point "
+            "confirmation threshold.\n\n"
 
             "🛑 NO ENTRY\n"
             "🛑 NO SL\n"
             "🛑 NO TP\n\n"
 
-            "The bot is waiting for stronger "
+            "Waiting for stronger "
             "M1/M5/M15 confirmation."
         )
 
@@ -1660,16 +1851,11 @@ def format_analysis_report(
 # SETUP ID
 # ============================================================
 
-def setup_id(
-    setup
-):
+def setup_id(setup):
 
     raw = (
-
         f"{setup['direction']}-"
-
         f"{setup['candle_time']}-"
-
         f"{round(setup['entry'], 2)}"
     )
 
@@ -1679,13 +1865,15 @@ def setup_id(
 
 
 # ============================================================
-# AUTOMATIC SCANNER
+# SCANNER
 # ============================================================
 
 def scanner():
 
     global LAST_AUTO_SETUP_ID
     global last_scanner_heartbeat
+    global last_scan_time
+    global last_scan_result
 
     logging.info(
         "=================================================="
@@ -1711,10 +1899,12 @@ def scanner():
 
             logging.info(
                 "🟢 SCANNER ALIVE | "
-                "starting XAUUSD scan"
+                "Starting XAUUSD scan"
             )
 
             result = analyze_market()
+
+            last_scan_time = time.time()
 
             last_scanner_heartbeat = (
                 time.time()
@@ -1722,26 +1912,19 @@ def scanner():
 
             if result:
 
+                last_scan_result = (
+                    f"M15={result['m15']} | "
+                    f"M5={result['m5']} | "
+                    f"BUY={result['buy_score']} | "
+                    f"SELL={result['sell_score']}"
+                )
+
                 logging.info(
-
-                    "ANALYSIS | "
-                    "M15=%s | "
-                    "M5=%s | "
-                    "BUY=%s | "
-                    "SELL=%s",
-
-                    result["m15"],
-
-                    result["m5"],
-
-                    result["buy_score"],
-
-                    result["sell_score"]
+                    "ANALYSIS | %s",
+                    last_scan_result
                 )
 
-                setup = result.get(
-                    "setup"
-                )
+                setup = result.get("setup")
 
                 if setup:
 
@@ -1771,12 +1954,9 @@ def scanner():
                             )
 
                             logging.info(
-
                                 "🚨 AUTO SIGNAL SENT | "
                                 "%s | SCORE=%s",
-
                                 setup["direction"],
-
                                 setup["score"]
                             )
 
@@ -1801,19 +1981,22 @@ def scanner():
 
             else:
 
+                last_scan_result = (
+                    "ANALYSIS FAILED"
+                )
+
                 logging.warning(
                     "Analysis returned no result."
                 )
 
-            last_scanner_heartbeat = (
-                time.time()
-            )
-
         except Exception as e:
 
+            last_scan_result = (
+                f"ERROR: {str(e)[:200]}"
+            )
+
             logging.exception(
-                "🔥 SCANNER ERROR: %s",
-                e
+                "🔥 SCANNER ERROR"
             )
 
         elapsed = (
@@ -1823,8 +2006,7 @@ def scanner():
 
         remaining = max(
             1,
-            SCAN_SECONDS
-            - elapsed
+            SCAN_SECONDS - elapsed
         )
 
         logging.info(
@@ -1833,22 +2015,9 @@ def scanner():
             remaining
         )
 
-        while (
-            remaining > 0
-            and
-            not SHUTDOWN_EVENT.is_set()
-        ):
-
-            sleep_time = min(
-                5,
-                remaining
-            )
-
-            SHUTDOWN_EVENT.wait(
-                sleep_time
-            )
-
-            remaining -= sleep_time
+        SHUTDOWN_EVENT.wait(
+            remaining
+        )
 
     logging.warning(
         "Scanner thread stopped."
@@ -1874,11 +2043,8 @@ def start_scanner_thread():
             return False
 
         scanner_thread = threading.Thread(
-
             target=scanner,
-
             name="gold-scanner",
-
             daemon=True
         )
 
@@ -1910,11 +2076,8 @@ def start_telegram_thread():
             return False
 
         telegram_thread = threading.Thread(
-
             target=telegram_polling,
-
             name="telegram-polling",
-
             daemon=True
         )
 
@@ -1941,7 +2104,7 @@ def supervisor():
     )
 
     logging.info(
-        "🛡 RITAMARIAGOLD SUPERVISOR STARTED"
+        "🛡 SUPERVISOR STARTED"
     )
 
     logging.info(
@@ -1953,122 +2116,98 @@ def supervisor():
         try:
 
             # ------------------------------------------------
-            # SCANNER
+            # Scanner
             # ------------------------------------------------
 
             if (
-
                 scanner_thread is None
-
                 or
-
                 not scanner_thread.is_alive()
             ):
 
                 scanner_restart_count += 1
 
                 logging.warning(
-
                     "⚠️ SCANNER DEAD - "
                     "RESTARTING #%s",
-
                     scanner_restart_count
                 )
 
                 start_scanner_thread()
 
             # ------------------------------------------------
-            # TELEGRAM
+            # Telegram
             # ------------------------------------------------
 
             if TELEGRAM_TOKEN:
 
                 if (
-
                     telegram_thread is None
-
                     or
-
                     not telegram_thread.is_alive()
                 ):
 
                     telegram_restart_count += 1
 
                     logging.warning(
-
                         "⚠️ TELEGRAM DEAD - "
                         "RESTARTING #%s",
-
                         telegram_restart_count
                     )
 
                     start_telegram_thread()
 
             # ------------------------------------------------
-            # HEARTBEAT
+            # Heartbeat
             # ------------------------------------------------
 
             now = time.time()
 
-            if last_scanner_heartbeat:
-
-                scanner_age = int(
-
+            scanner_age = (
+                int(
                     now
                     - last_scanner_heartbeat
                 )
+                if last_scanner_heartbeat
+                else -1
+            )
 
-            else:
-
-                scanner_age = -1
-
-            if last_telegram_heartbeat:
-
-                telegram_age = int(
-
+            telegram_age = (
+                int(
                     now
                     - last_telegram_heartbeat
                 )
-
-            else:
-
-                telegram_age = -1
+                if last_telegram_heartbeat
+                else -1
+            )
 
             logging.info(
 
                 "🛡 WATCHDOG | "
                 "Scanner=%s | "
                 "Telegram=%s | "
-                "Scanner heartbeat=%ss | "
-                "Telegram heartbeat=%ss",
+                "ScannerHB=%ss | "
+                "TelegramHB=%ss",
 
                 (
-
                     "ALIVE"
-
                     if (
                         scanner_thread
                         and
                         scanner_thread.is_alive()
                     )
-
                     else
-
                     "DEAD"
                 ),
 
                 (
-
                     "ALIVE"
-
                     if (
                         telegram_thread
                         and
                         telegram_thread.is_alive()
                     )
-
                     else
-
                     "DEAD"
                 ),
 
@@ -2077,11 +2216,10 @@ def supervisor():
                 telegram_age
             )
 
-        except Exception as e:
+        except Exception:
 
             logging.exception(
-                "Supervisor error: %s",
-                e
+                "Supervisor error."
             )
 
         SHUTDOWN_EVENT.wait(10)
@@ -2112,50 +2250,47 @@ def start_background_services():
 
         services_started = True
 
-    logging.info(
-        "=================================================="
-    )
-
-    logging.info(
-        "🚀 STARTING RITAMARIAGOLD SERVICES"
-    )
-
-    logging.info(
-        "=================================================="
-    )
-
-    # Scanner
-
-    start_scanner_thread()
-
-    # Telegram
-
-    if TELEGRAM_TOKEN:
-
-        start_telegram_thread()
-
-    else:
-
-        logging.error(
-            "❌ TELEGRAM_TOKEN missing."
+        logging.info(
+            "=================================================="
         )
 
-    # Supervisor
+        logging.info(
+            "🚀 STARTING RITAMARIAGOLD"
+        )
 
-    supervisor_thread = threading.Thread(
+        logging.info(
+            "=================================================="
+        )
 
-        target=supervisor,
+        # Start scanner
 
-        name="bot-supervisor",
+        start_scanner_thread()
 
-        daemon=True
-    )
+        # Start Telegram
 
-    supervisor_thread.start()
+        if TELEGRAM_TOKEN:
 
-    logging.info(
-        "🟢 ALL BACKGROUND SERVICES STARTED."
-    )
+            start_telegram_thread()
+
+        else:
+
+            logging.error(
+                "❌ TELEGRAM_TOKEN missing."
+            )
+
+        # Start supervisor
+
+        supervisor_thread = threading.Thread(
+            target=supervisor,
+            name="bot-supervisor",
+            daemon=True
+        )
+
+        supervisor_thread.start()
+
+        logging.info(
+            "🟢 ALL BACKGROUND SERVICES STARTED."
+        )
 
 
 # ============================================================
@@ -2169,35 +2304,27 @@ def start_background_services():
 def home():
 
     scanner_alive = (
-
         scanner_thread is not None
-
         and
-
         scanner_thread.is_alive()
     )
 
     telegram_alive = (
-
         telegram_thread is not None
-
         and
-
         telegram_thread.is_alive()
     )
 
     supervisor_alive = (
-
         supervisor_thread is not None
-
         and
-
         supervisor_thread.is_alive()
     )
 
     return jsonify({
 
-        "status": "online",
+        "status":
+            "online",
 
         "bot":
             "RitamariaGold",
@@ -2205,32 +2332,35 @@ def home():
         "symbol":
             SYMBOL,
 
-        "scan_seconds":
-            SCAN_SECONDS,
-
-        "minimum_score":
-            MIN_SCORE,
-
         "scanner":
             "running"
             if scanner_alive
-            else "stopped",
+            else
+            "stopped",
 
         "telegram":
             "running"
             if telegram_alive
-            else "stopped",
+            else
+            "stopped",
 
         "supervisor":
             "running"
             if supervisor_alive
-            else "stopped",
+            else
+            "stopped",
 
         "scanner_restarts":
             scanner_restart_count,
 
         "telegram_restarts":
-            telegram_restart_count
+            telegram_restart_count,
+
+        "last_scan":
+            last_scan_result,
+
+        "server_time":
+            now_string()
     })
 
 
@@ -2245,29 +2375,20 @@ def home():
 def health():
 
     scanner_alive = (
-
         scanner_thread is not None
-
         and
-
         scanner_thread.is_alive()
     )
 
     telegram_alive = (
-
         telegram_thread is not None
-
         and
-
         telegram_thread.is_alive()
     )
 
     supervisor_alive = (
-
         supervisor_thread is not None
-
         and
-
         supervisor_thread.is_alive()
     )
 
@@ -2290,6 +2411,9 @@ def health():
 
         "telegram_restarts":
             telegram_restart_count,
+
+        "last_scan":
+            last_scan_result,
 
         "timestamp":
             int(time.time())
@@ -2315,10 +2439,11 @@ def manual_signal():
         if not result:
 
             return jsonify({
-
                 "status":
-                    "analysis_failed"
+                    "analysis_failed",
 
+                "data_error":
+                    last_data_error
             }), 500
 
         message = format_analysis_report(
@@ -2332,15 +2457,14 @@ def manual_signal():
         if not sent:
 
             return jsonify({
-
                 "status":
-                    "telegram_failed"
+                    "telegram_failed",
 
+                "telegram_error":
+                    last_telegram_error
             }), 500
 
-        setup = result.get(
-            "setup"
-        )
+        setup = result.get("setup")
 
         if setup:
 
@@ -2354,14 +2478,19 @@ def manual_signal():
                 "analysis_sent",
 
             "has_signal":
-                bool(setup)
+                bool(setup),
+
+            "buy_score":
+                result["buy_score"],
+
+            "sell_score":
+                result["sell_score"]
         })
 
     except Exception as e:
 
         logging.exception(
-            "Manual signal error: %s",
-            e
+            "Manual signal error."
         )
 
         return jsonify({
@@ -2414,8 +2543,7 @@ def telegram_webhook():
     except Exception as e:
 
         logging.exception(
-            "Webhook error: %s",
-            e
+            "Webhook error."
         )
 
         return jsonify({
@@ -2430,18 +2558,7 @@ def telegram_webhook():
 
 
 # ============================================================
-# IMPORTANT:
-# START SERVICES WHEN MODULE IS LOADED
-# ============================================================
-#
-# This is intentionally OUTSIDE:
-#
-# if __name__ == "__main__":
-#
-# because Render commonly launches Flask through Gunicorn.
-#
-# Gunicorn imports this file. It does not execute it as
-# __main__. Therefore the scanner must be started here.
+# START SERVICES ON IMPORT
 # ============================================================
 
 start_background_services()
@@ -2466,10 +2583,7 @@ if __name__ == "__main__":
     )
 
     app.run(
-
         host="0.0.0.0",
-
         port=port,
-
         threaded=True
     )
